@@ -1,0 +1,161 @@
+category="common"
+label="Local LLM"
+group="llm"
+section="local ai"
+# A 27B takes a while to page onto the card, and the toggle does not report
+# success until the server actually answers. force rather than rollback: if it
+# will not come up, the half-started unit should go away, not be restarted.
+timeout=120
+on_timeout=force
+# Started last in a preset. headless-ai frees the GPU by switching the desktop
+# off; loading 12 GB of weights while the desktop still holds its GB is how you
+# get an out-of-memory instead of a speed-up.
+defer_on=1
+_unit="vibecontrol-llm"
+
+# Nothing about the model is hardcoded. These live in ~/.config/vibecontrol/config
+# so another machine, or another quant, needs no edit here:
+#
+#   llm.model   = ~/models/Qwen3.8-27B-UD-Q3_K_XL.gguf
+#   llm.host    = <hotspot-ip>        (hotspot only; 127.0.0.1 to keep it local)
+#   llm.port    = 8080
+#   llm.ctx     = 16384
+#   llm.keyfile = ~/.config/vibecontrol/llm.key   (optional)
+#   llm.think   = 0 | 1            (default 0)
+#   llm.alias   = local            (name clients use; default "local")
+#   llm.mcp_config = /path/to/mcp.json         (optional)
+#   llm.cors_origins = http://<hotspot-ip>:8080   (optional)
+#
+# llm.mcp_config gives the server tools. llama-server spawns each declared MCP
+# server itself, as a child process speaking JSON-RPC on stdio -- the only
+# transport it supports -- lists its tools once at startup and respawns it on
+# demand when a tool is called. They then appear as <server>_<tool> in the web
+# UI and in GET /tools, for every client, with nothing to start separately.
+#
+# The file is Cursor-compatible: {"mcpServers": {"name": {"command": ..., "args": []}}}
+#
+# llm.cors_origins goes with it. Declaring MCP servers makes llama-server limit
+# CORS to localhost for security, which locks out a browser on any other
+# machine, so the real origin has to be named.
+#
+# llm.think controls reasoning models. Left on, a model like Qwen3.6 emits its
+# whole thinking process before answering: the reply arrives in
+# reasoning_content and `content` stays empty until it is done, which burns
+# hundreds of tokens on small tasks and shows as an EMPTY REPLY in any client
+# that reads only `content`. Off is the right default for a daily driver;
+# turn it on for hard questions.
+#
+# The server speaks the OpenAI API, so any harness that can be pointed at a
+# custom base URL drives it -- the editor on another machine, or an agent here.
+
+# Every setting is looked up per profile first, then as a plain llm.* default.
+# That way host, port, keyfile and the MCP config are written once and shared,
+# while model, ctx and alias vary per profile -- and adding a profile is a
+# config edit, not a code change.
+_profile() { local v; v=$(cfg_text llm.profile); echo "${v:-default}"; }
+_p() {
+    local v
+    v=$(cfg_text "llm.profile.$(_profile).$1")
+    [[ -n $v ]] || v=$(cfg_text "llm.$1")
+    # The config is read with grep, so a leading ~ arrives as a literal and any
+    # path written that way would fail every -f test. Expand it here rather than
+    # requiring absolute paths, because ~ is what people write.
+    [[ $v == "~/"* ]] && v="$HOME/${v#\~/}"
+    echo "$v"
+}
+
+_model()   { _p model; }
+_host()    { local v; v=$(_p host); echo "${v:-127.0.0.1}"; }
+_port()    { local v; v=$(_p port); echo "${v:-8080}"; }
+_ctx()     { local v; v=$(_p ctx);  echo "${v:-8192}"; }
+_keyfile() { _p keyfile; }
+_think()   { local v; v=$(_p think); echo "${v:-0}"; }
+_alias()   { local v; v=$(_p alias); echo "${v:-local}"; }
+_mcpcfg()  { _p mcp_config; }
+_cors()    { _p cors_origins; }
+
+t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
+
+t_on() {
+    local m host port ctx key i _mcp _co
+    m=$(_model)
+    # rc 2 means "not configured", which the daemon reports as unavailable
+    # rather than as a failure -- there is nothing to retry.
+    [[ -n $m && -f $m ]] || return 2
+    command -v llama-server >/dev/null 2>&1 || return 2
+    host=$(_host); port=$(_port); ctx=$(_ctx); key=$(_keyfile)
+
+    local -a args=(
+        -m "$m" --host "$host" --port "$port"
+        # --jinja makes the server use the chat template embedded in the GGUF.
+        # Without it tool calls are never emitted in a form a harness can parse,
+        # which is the difference between an agent and a chatbot.
+        --jinja
+        # -fa is not optional here: quantising the KV cache requires flash
+        # attention, and the server refuses to start without it. It takes a
+        # value since 0.4.1 -- a bare -fa swallows the next argument and the
+        # server dies with "unknown value for --flash-attn: '-ctk'".
+        -fa on -ctk q8_0 -ctv q8_0
+        -ngl 999 -c "$ctx"
+        # Without an alias the model id is the full path on disk, which is what
+        # a client has to type as the model name.
+        --alias "$(_alias)"
+        # One slot: --parallel N divides the context between slots, so asking
+        # for 16k with two slots gives each client only 8k.
+        --parallel 1
+    )
+    [[ -n $key && -f $key ]] && args+=(--api-key-file "$key")
+    # Only passed when disabling: a template without the variable ignores it,
+    # but there is no reason to send it when thinking is wanted.
+    [[ $(_think) == 1 ]] || args+=(--chat-template-kwargs '{"enable_thinking":false}')
+    _mcp=$(_mcpcfg)
+    if [[ -n $_mcp && -f $_mcp ]]; then
+        args+=(--mcp-servers-config "$_mcp")
+        _co=$(_cors); [[ -z $_co ]] && _co="http://$host:$port"
+        args+=(--cors-origins "$_co")
+    fi
+
+    vc_progress "loading $(basename "$m")"
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    systemd-run --user --unit="$_unit" --description="vibecontrol: local LLM server" \
+        --setenv=HIP_VISIBLE_DEVICES=0 \
+        /usr/bin/llama-server "${args[@]}" >/dev/null 2>&1 || return 1
+
+    # systemd returns the moment it forks, which is long before the weights are
+    # on the card. Wait for the server to answer instead, so a preset that turns
+    # this on does not report done while it is still loading. No signal exists
+    # for "http server is ready", so this one has to ask.
+    for i in $(seq 1 100); do
+        curl -sf --max-time 2 "http://$host:$port/health" >/dev/null 2>&1 && {
+            vc_progress "serving on $host:$port"; return 0; }
+        [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] || return 1
+        sleep 1
+    done
+    return 1
+}
+
+# Stopping is not instant and it is worth showing: the unit takes a moment to
+# come down, and the driver hands back the VRAM some time after the process has
+# actually gone. Reporting "off" while the card still looks full is how the next
+# thing to want the GPU fails for no visible reason.
+t_off() {
+    local i card=/sys/class/drm/card1/device
+    vc_progress "stopping the server"
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    [[ -r $card/mem_info_vram_used ]] || return 0
+    for i in $(seq 1 20); do
+        (( $(cat "$card/mem_info_vram_used") < 1073741824 )) && return 0
+        [[ $i == 1 ]] && vc_progress "releasing the GPU"
+        sleep 1
+    done
+    return 0
+}
+
+t_force() {
+    local want="$1"
+    [[ $want == on ]] && { t_on; return; }
+    vc_progress "killing the server"
+    systemctl --user kill --signal=KILL "$_unit" >/dev/null 2>&1
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+}

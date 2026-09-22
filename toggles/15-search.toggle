@@ -1,0 +1,70 @@
+category="common"
+label="Web search"
+group="search"
+section="local ai"
+# Nested under the LLM feature: on its own a search backend does nothing,
+# and the tools it provides are only reachable through the model server.
+# Still independently switchable -- the model is useful without it, and
+# stopping it should not imply stopping the model.
+parent="llm"
+# The image is pulled, but a cold container still has to boot python and load
+# engine settings; 90s is generous rather than tight.
+timeout=90
+on_timeout=force
+_unit="searxng.service"
+
+
+# SearXNG, the search backend behind lib/mcp-search.py. Without it the model
+# answers from memory, which for anything current means answering confidently
+# and wrongly.
+#
+# Runs as a rootless podman container declared in
+# ~/.config/containers/systemd/searxng.container, which systemd turns into
+# searxng.service at daemon-reload. Quadlet rather than `podman run` so the
+# container is an ordinary user unit like everything else here -- startable,
+# stoppable and inspectable with systemctl, and kept alive by the same linger
+# that keeps the daemon up with no desktop.
+#
+# Published to 127.0.0.1 only: SearXNG has no authentication of its own and
+# the hotspot carries other devices. A client on another machine reaches it
+# through ssh, not by opening the port.
+
+t_status() {
+    [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off
+}
+
+t_on() {
+    local i
+    command -v podman >/dev/null 2>&1 || return 2
+    systemctl --user show "$_unit" >/dev/null 2>&1 || return 2
+    vc_progress "starting the search container"
+    systemctl --user start "$_unit" >/dev/null 2>&1 || return 1
+    # The unit is active the moment the container starts; the service inside it
+    # is not. Wait for an actual answer.
+    for i in $(seq 1 60); do
+        curl -sf --max-time 2 "http://127.0.0.1:8888/" >/dev/null 2>&1 && break
+        [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] || return 1
+        sleep 1
+    done
+    curl -sf --max-time 2 "http://127.0.0.1:8888/" >/dev/null 2>&1 || return 1
+    # Nothing else to start: llama-server spawns lib/mcp-search.py itself, on
+    # demand, as a stdio child process. This toggle only owns the backend it
+    # queries.
+    vc_progress "search ready on 127.0.0.1:8888"
+    return 0
+}
+
+# podman gives the container its stop timeout before killing it, so this can
+# take several seconds -- long enough that silence looks like a hang.
+t_off() {
+    vc_progress "stopping the search container"
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+}
+
+t_force() {
+    local want="$1"
+    [[ $want == on ]] && { t_on; return; }
+    systemctl --user kill --signal=KILL "$_unit" >/dev/null 2>&1
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+}

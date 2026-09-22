@@ -1,0 +1,82 @@
+category="wm"
+label="Steam (PipeWire)"
+group="steam"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+# Steam is slow on both ends: up to 25s to shut an existing client down and up
+# to 40s for a new one to appear. The deadline has to clear the sum of those,
+# or the daemon kills a perfectly healthy launch half way through.
+timeout=90
+on_timeout=force
+_unit="vibecontrol-steam"
+
+# On means a Steam client is running with -pipewire, which is what Remote Play
+# needs for desktop capture on Wayland. Plain `steam` from the menu is left
+# alone; this toggle is the way to get the flag, not a replacement launcher.
+_with_flag() {
+    local p
+    for p in $(pgrep -x steam 2>/dev/null); do
+        [[ $(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null) == *-pipewire* ]] && return 0
+    done
+    return 1
+}
+_wait_gone() {
+    local i
+    for i in $(seq 1 25); do
+        pgrep -x steam >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    return 1
+}
+
+t_status() { _with_flag && echo on || echo off; }
+
+# Steam refuses a second client, so an already-running plain instance has to
+# be shut down first. Startup is slow, hence the generous wait.
+t_on() {
+    local i
+    command -v steam >/dev/null 2>&1 || return 2
+    _with_flag && return 0
+    if pgrep -x steam >/dev/null 2>&1; then
+        steam -shutdown >/dev/null 2>&1
+        _wait_gone || return 1
+    fi
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    # PartOf ties Steam to the session, so it is stopped properly whenever the
+    # desktop goes away -- including a logout from the Plasma menu. That used
+    # to happen for free, because logging out stopped the user manager; with
+    # linger enabled (the desktop toggle needs it) the user manager survives,
+    # and without this Steam would outlive the compositor it is drawing on.
+    systemd-run --user --unit="$_unit" --description="vibecontrol: Steam with PipeWire capture" \
+        --property=PartOf=graphical-session.target \
+        --property=After=graphical-session.target \
+        steam -pipewire >/dev/null 2>&1 || return 1
+    for i in $(seq 1 40); do
+        sleep 1
+        _with_flag && return 0
+    done
+    return 1
+}
+
+# Runs if the ordinary path overran its deadline and was killed. Steam ignoring
+# a polite shutdown is exactly the case this exists for.
+t_force() {
+    local want="$1"
+    [[ $want == on ]] && { t_on; return; }
+    vc_progress "Steam did not quit - killing it"
+    systemctl --user kill --signal=KILL "$_unit" >/dev/null 2>&1
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    pkill -x steam 2>/dev/null
+    sleep 1
+    ! pgrep -x steam >/dev/null 2>&1
+}
+
+# Off quits Steam rather than restarting it plain: relaunching without the
+# flag would be a surprising thing for an "off" to do.
+t_off() {
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    pgrep -x steam >/dev/null 2>&1 || return 0
+    steam -shutdown >/dev/null 2>&1
+    _wait_gone
+}

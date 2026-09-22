@@ -1,0 +1,99 @@
+category="wm"
+label="WoW remote play"
+group="wow"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+
+# Two things move together: the desktop mode and WoW's own config.
+#
+# The desktop mode matters because black bars are an aspect mismatch. The
+# client draws into 3024x1898 (its panel minus the menu-bar strip), so a
+# desktop at exactly that size streams 1:1 with no bars and no resampling.
+# It is larger than the physical 2560x1440 panel, which the GPU accepts and
+# downscales locally -- the local view softens, the stream is exact.
+#
+# WoW's config is swapped as a whole file per mode rather than edited cvar by
+# cvar, so anything changed from the game's own settings menu is kept and
+# accumulates per mode.
+#
+# NB: windowed size is GxWindowedResolution, NOT gxResolution. gxResolution
+# only applies to exclusive fullscreen, which under Proton also negotiates
+# display modes and was a source of errors -- hence borderless windowed.
+_mode_file="${XDG_CONFIG_HOME:-$HOME/.config}/vibecontrol/wow-mode"
+_wow="$HOME/.local/share/Steam/steamapps/compatdata/2384571406/pfx/drive_c/Program Files (x86)/World of Warcraft"
+
+_res_on="3024x1898"
+_res_off="2560x1440"
+_seed_on="gxWindow=1 GxMaximize=1 GxWindowedResolution=3024x1898 gxResolution=3024x1898 GxApi=D3D11"
+_seed_off="gxWindow=1 GxMaximize=1 GxWindowedResolution=2560x1414 gxResolution=2560x1440 GxApi=D3D11"
+
+_out() {
+    kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | awk '/^Output:/{n=$3} /^[[:space:]]+enabled$/{print n; exit}'
+}
+_mode_index() {
+    kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -oE "[0-9]+:$1@[0-9.]+" | sort -t@ -k2 -rn | head -1 | cut -d: -f1
+}
+# kscreen-doctor cannot parse WxH@refresh when the refresh has a decimal, so
+# modes are addressed by index. Custom modes survive reboots but recreate
+# cheaply if they do not.
+_set_mode() {
+    local o i w h
+    o=$(_out); [[ -n $o ]] || return 0
+    i=$(_mode_index "$1")
+    if [[ -z $i ]]; then
+        w="${1%x*}"; h="${1#*x}"
+        kscreen-doctor "output.1.addCustomMode.$w.$h.60000.reduced" >/dev/null 2>&1
+        sleep 1
+        i=$(_mode_index "$1")
+    fi
+    [[ -n $i ]] || return 1
+    kscreen-doctor "output.$o.mode.$i" >/dev/null 2>&1
+}
+
+_configs() { find "$_wow" -name Config.wtf 2>/dev/null; }
+# WoW rewrites Config.wtf wholesale when it exits, so a swap underneath a
+# running client is silently discarded. Refuse instead of pretending.
+_running() { ps -eo comm --no-headers | grep -qiE '^(wow|wowclassic|worldofwarcraft)'; }
+_put() {
+    local f="$1" k="$2" v="$3" cr=""
+    grep -q $'\r' "$f" 2>/dev/null && cr=$'\r'
+    if grep -qiE "^SET $k " "$f" 2>/dev/null; then
+        sed -i "s/^SET $k .*/SET $k \"$v\"$cr/I" "$f"
+    else
+        printf 'SET %s "%s"%s\n' "$k" "$v" "$cr" >>"$f"
+    fi
+}
+_swap_to() {
+    local want="$1" cur f slot_want slot_cur seed kv
+    cur=$(t_status)
+    if [[ $cur != "$want" ]]; then
+        _running && return 1
+        while read -r f; do
+            [[ -f $f ]] || continue
+            slot_cur="${f%/Config.wtf}/Config.vibecontrol-$cur.wtf"
+            slot_want="${f%/Config.wtf}/Config.vibecontrol-$want.wtf"
+            cp -f "$f" "$slot_cur"                   # keep what WoW last wrote
+            if [[ -f $slot_want ]]; then
+                cp -f "$slot_want" "$f"
+            else
+                [[ $want == on ]] && seed="$_seed_on" || seed="$_seed_off"
+                for kv in $seed; do _put "$f" "${kv%%=*}" "${kv#*=}"; done
+                cp -f "$f" "$slot_want"
+            fi
+        done < <(_configs)
+        mkdir -p "$(dirname "$_mode_file")" 2>/dev/null
+        printf '%s\n' "$want" >"$_mode_file"
+    fi
+    # Applied even when the config was already right: the toggle should
+    # describe the screen, not just which files are in place.
+    [[ $want == on ]] && _set_mode "$_res_on" || _set_mode "$_res_off"
+}
+
+t_status() {
+    [[ $(cat "$_mode_file" 2>/dev/null) == on ]] && echo on || echo off
+}
+t_on()  { _swap_to on; }
+t_off() { _swap_to off; }

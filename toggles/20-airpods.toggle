@@ -1,0 +1,10 @@
+category="wm"
+label="AirPods mic switch"
+group="airpods"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+_setting="bluetooth.autoswitch-to-headset-profile"
+t_status() { LC_ALL=C wpctl settings "$_setting" 2>/dev/null | grep -qE 'Value:[[:space:]]*true' && echo on || echo off; }
+t_on()     { wpctl settings --save "$_setting" true  >/dev/null 2>&1; }
+t_off()    { wpctl settings --save "$_setting" false >/dev/null 2>&1; }

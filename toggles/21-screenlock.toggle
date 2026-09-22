@@ -1,0 +1,29 @@
+category="wm"
+label="Screen lock"
+group="screenlock"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+_unit="vibecontrol-screenlock-inhibit"
+# Resolve the helper through this file's own location so it works via the
+# ~/.config/vibecontrol/toggles symlink.
+_helper="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/lib/screensaver-inhibit.py"
+
+# The reported state is the lock itself, not the inhibit: on means the screen
+# locks normally, off means locking is suppressed. The transient unit holds
+# the inhibit, so it is active exactly when this toggle reads as off.
+t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo off || echo on; }
+
+# on = normal locking, i.e. release the inhibit.
+t_on() { systemctl --user stop "$_unit" >/dev/null 2>&1; }
+
+# off = suppress locking. The inhibit lives only as long as the process
+# holding the D-Bus connection, so it is anchored in a transient unit.
+t_off() {
+    [[ -x $_helper ]] || return 2
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    systemd-run --user --unit="$_unit" --description="vibecontrol: suppress screen lock" \
+        "$_helper" >/dev/null 2>&1 || return 1
+    sleep 0.5
+    [[ $(systemctl --user is-active "$_unit") == active ]] || return 1
+}

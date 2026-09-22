@@ -1,0 +1,12 @@
+[Unit]
+Description=vibecontrol daemon - owns machine-mode feature state
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vibecontrold
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

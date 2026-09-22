@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""vibecontrol - thin client for vibecontrold.
+
+Talks to the daemon and nothing else: it sends one-line commands on a fifo and
+renders the daemon's state document. It runs no feature work itself.
+
+Which entries block each other is read from the document's `groups`, so nothing
+about the lock topology is hardcoded here. A keypress marks its row busy
+immediately; any document from the daemon replaces that local guess.
+
+Rows are navigated with j/k or the arrow keys and toggled with enter or space.
+Digits 1-9 are shortcuts for the first nine features in display order, assigned
+by position rather than declared per feature, so adding a feature never
+renumbers the ones above it and there is no key to pick or clash.
+"""
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "vibecontrol")
+CMD = os.path.join(RUN, "cmd")
+STATE = os.path.join(RUN, "state.json")
+CLIENTS = os.path.join(RUN, "clients")
+UNIT = "vibecontrol-daemon.service"
+OVERLAY_TTL = 15.0          # drop a local guess the daemon never confirmed
+
+C = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "rev": "\033[7m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m", "cyan": "\033[36m",
+}
+
+
+def send(line):
+    """Fire a command at the daemon. Never blocks: no daemon, no command."""
+    try:
+        fd = os.open(CMD, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, (line + "\n").encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def read_state():
+    try:
+        with open(STATE) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    pid = doc.get("daemon", {}).get("pid", 0)
+    if not pid or not os.path.isdir("/proc/%d" % pid):
+        return None
+    return doc
+
+
+def unit_active():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0
+
+
+def daemon_start():
+    subprocess.run(["systemctl", "--user", "start", UNIT],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def daemon_restart():
+    subprocess.run(["systemctl", "--user", "restart", UNIT],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def daemon_stop():
+    if unit_active():
+        subprocess.run(["systemctl", "--user", "stop", UNIT],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        send("stop")          # started by hand: ask it to exit
+
+
+ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end"}
+
+# Keys offered to presets, in order. None of these collide with the fixed keys
+# (d/c/r/x/b), the cursor keys, or the positional digits.
+PRESET_KEYS = "poiuy"
+LEFT_COL = 44
+PRESET_CELL = 13
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def vis_len(text):
+    """Printable width, ignoring colour escapes."""
+    return len(_ANSI.sub("", text))
+
+
+STDIN = sys.stdin.fileno()
+
+
+def _getch(timeout=None):
+    """Unbuffered single byte. sys.stdin.read() must not be used alongside
+    select(): it buffers ahead, so a second keypress already pulled into
+    Python's buffer leaves select() reporting nothing to read."""
+    if timeout is not None and not select.select([STDIN], [], [], timeout)[0]:
+        return ""
+    try:
+        return os.read(STDIN, 1).decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def read_key():
+    """One keypress. Escape sequences collapse to names; a lone ESC stays ESC."""
+    ch = _getch()
+    if ch != "\x1b":
+        return ch
+    if _getch(0.05) != "[":
+        return "\x1b"
+    return ARROWS.get(_getch(0.05), "\x1b")
+
+
+# Room inside the brackets for the busy marker and a countdown side by side.
+# The space is always there, so a timer appearing never moves anything, and the
+# countdown sits inside the badge's own colour rather than beside it.
+BADGE_W = 10
+
+WORDS = {"on": "ON", "off": "OFF", "partial": "PART",
+         "to_on": "~~ON~~", "to_off": "~~OFF~", "na": "N/A"}
+FORCED_WORDS = {"to_on": "!!ON!!", "to_off": "!!OFF!"}
+
+
+def badge(state, locked=False, timer="", forced=False):
+    word = (FORCED_WORDS if forced else WORDS).get(state) or WORDS.get(state, "????")
+    if timer:
+        body = "%-*s%s" % (max(0, BADGE_W - len(timer)), word, timer)
+    else:
+        body = word.center(BADGE_W)
+    text = "[" + body[:BADGE_W] + "]"
+    if locked or state == "na":
+        return C["dim"] + text + C["reset"]
+    if forced:
+        return C["red"] + C["bold"] + text + C["reset"]
+    colour = {"on": C["green"] + C["bold"], "off": C["dim"],
+              "partial": C["yellow"] + C["bold"],
+              "to_on": C["yellow"] + C["bold"], "to_off": C["yellow"] + C["bold"]}[state]
+    return colour + text + C["reset"]
+
+
+class Row:
+    """One line of the menu. Only rows with an action are selectable."""
+
+    def __init__(self, label, state=None, key=None, action=None,
+                 locked=False, heading=False, tid=None, timer="", forced=False):
+        self.label = label
+        self.timer = timer
+        self.forced = forced
+        self.state = state
+        self.key = key            # fixed key shown instead of a digit
+        self.action = action      # callable, or None for a heading
+        self.locked = locked
+        self.heading = heading
+        self.tid = tid            # toggle id, so presets can align to this row
+        self.digit = None         # filled in by build()
+
+    @property
+    def selectable(self):
+        return self.action is not None
+
+    def render(self, cursor):
+        if self.heading:
+            return "  " + C["dim"] + self.label + C["reset"]
+        marker = C["cyan"] + C["bold"] + ">" + C["reset"] if cursor else " "
+        shown = self.key if self.key else (str(self.digit) if self.digit else " ")
+        kc = C["dim"] if self.locked else C["cyan"]
+        lc = C["dim"] if self.locked else ""
+        return "%s  %s%s%s  %s%-22s%s %s" % (
+            marker, kc, shown, C["reset"], lc, self.label, C["reset"],
+            badge(self.state, self.locked, self.timer, self.forced)
+            if self.state else "")
+
+
+class UI:
+    def __init__(self):
+        self.doc = None
+        self.overlay = {}          # feature id -> (target, sent_at)
+        self.msg = ""
+        self.screen = "main"
+        self.cursor = 0
+        self.cursor_placed = False
+        self.daemon_armed = False
+        self.preset_armed = None
+        self.preset_keys = {}
+        self.last_frame = None
+        self.rows = []
+
+    # ---------------------------------------------------------------- state
+    def adopt(self, doc):
+        """A document from the daemon wholly replaces our local guesses."""
+        self.doc = doc
+        self.overlay.clear()
+        if doc:
+            self.msg = doc.get("msg", "")
+
+    def expire_overlay(self):
+        now = time.time()
+        for fid in [f for f, (_, t) in self.overlay.items() if now - t > OVERLAY_TTL]:
+            del self.overlay[fid]
+            self.msg = C["red"] + "no response from daemon" + C["reset"]
+
+    def toggles(self):
+        return self.doc.get("toggles", []) if self.doc else []
+
+    def presets(self):
+        """Only the ones worth a key. A preset the daemon applies itself at boot
+        or on resume still works and is still listed on the config screen -- it
+        just does not need a column here."""
+        all_p = (self.doc or {}).get("presets", {})
+        hidden = set(((self.doc or {}).get("auto") or {}).get("hidden") or [])
+        return {k: v for k, v in all_p.items() if k not in hidden}
+
+    def auto_presets(self):
+        return (self.doc or {}).get("auto") or {}
+
+    def status_of(self, tid):
+        for t in self.toggles():
+            if t["id"] == tid:
+                return t["status"]
+        return None
+
+    def preset_matrix(self):
+        """One column per preset, each cell on the same line as its toggle.
+
+        Reading across a row shows what every preset would do to that toggle;
+        reading down a column shows the whole preset. A toggle a preset does
+        not mention shows a dash, which is the do-not-touch state."""
+        presets = self.presets()          # config order, not sorted
+        if not self.doc or not presets:
+            return [], []
+        self.preset_keys = {}
+        names = []
+        for i, name in enumerate(presets):
+            if i >= len(PRESET_KEYS):
+                break
+            self.preset_keys[PRESET_KEYS[i]] = name
+            names.append(name)
+
+        head_keys, head_names = "", ""
+        for i, name in enumerate(names):
+            armed = self.preset_armed == name
+            colour = C["yellow"] + C["bold"] if armed else C["bold"]
+            head_keys += "%s%s%s%s" % (C["cyan"], PRESET_KEYS[i], C["reset"],
+                                       " " * (PRESET_CELL - 1))
+            head_names += "%s%-*s%s" % (colour, PRESET_CELL, name[:PRESET_CELL - 1],
+                                        C["reset"])
+        header = [head_keys, head_names]
+
+        cells = []
+        for r in self.rows:
+            if r.heading or not r.tid:
+                cells.append("")
+                continue
+            line = ""
+            for name in names:
+                target = presets[name].get(r.tid)
+                if target is None:
+                    line += C["dim"] + "%-*s" % (PRESET_CELL, "-") + C["reset"]
+                elif self.status_of(r.tid) == target:
+                    line += C["dim"] + "%-*s" % (PRESET_CELL, target.upper()) + C["reset"]
+                else:
+                    line += (C["yellow"] + C["bold"]
+                             + "%-*s" % (PRESET_CELL, target.upper()) + C["reset"])
+            cells.append(line)
+        return header, cells
+
+    def llm_profiles(self):
+        """(name, fields) pairs, active first is NOT enforced -- stable order
+        matters more than ordering by state when the cursor lives here."""
+        llm = (self.doc or {}).get("llm") or {}
+        return sorted((llm.get("profiles") or {}).items())
+
+    def llm_active(self):
+        return ((self.doc or {}).get("llm") or {}).get("profile")
+
+    def pick_profile(self, name):
+        if name == self.llm_active():
+            self.msg = C["dim"] + "%s is already loaded" % name + C["reset"]
+            return
+        send("profile %s" % name)
+        self.msg = C["yellow"] + "loading %s" % name + C["reset"]
+        self.screen = "main"
+
+    def anything_busy(self):
+        return any(self.busy_of(t) for t in self.toggles())
+
+    def busy_note(self):
+        """What a running toggle last said about itself, if anything."""
+        for tog in self.toggles():
+            if self.busy_of(tog) and tog.get("note"):
+                return "%s: %s" % (tog["label"], tog["note"])
+        return ""
+
+    def graphical(self):
+        return bool(self.doc and self.doc.get("session", {}).get("graphical"))
+
+    def busy_of(self, tog):
+        if tog["id"] in self.overlay:
+            return self.overlay[tog["id"]][0]
+        return tog["busy"]
+
+    def group_owner(self, group):
+        for f in self.toggles():
+            if f["group"] == group and self.busy_of(f):
+                return f["id"]
+        g = self.doc.get("groups", {}).get(group, {}) if self.doc else {}
+        return g.get("owner") if g.get("busy") else None
+
+    def locked(self, tog):
+        if not tog.get("available", True):
+            return True
+        owner = self.group_owner(tog["group"])
+        return owner is not None and owner != tog["id"]
+
+    def timer_of(self, tog):
+        """How long the running task has left, once it is worth showing.
+
+        Counting down rather than up: the number then means something on its
+        own -- how long before the daemon forces or rolls this back -- instead
+        of having to be held against a timeout the row does not show.
+
+        Nothing under 2 seconds: most toggles finish inside that and a number
+        flashing up for a single frame is noise.
+        """
+        since = tog.get("busy_since")
+        if not since or not self.busy_of(tog):
+            return ""
+        elapsed = int(time.time()) - int(since)
+        if elapsed < 2:
+            return ""
+        limit = tog.get("timeout") or 0
+        if not limit:
+            return "%ds" % elapsed
+        return "%ds" % max(0, limit - elapsed)
+
+    def display_state(self, tog):
+        if not tog.get("available", True):
+            return "na"
+        busy = self.busy_of(tog)
+        return "to_" + busy if busy else tog["status"]
+
+    # --------------------------------------------------------------- actions
+    def toggle_daemon(self):
+        daemon_stop() if self.doc else daemon_start()
+
+    def flip(self, tog):
+        if not tog.get("available", True):
+            self.msg = C["dim"] + "%s needs a desktop session" % tog["label"] + C["reset"]
+            return
+        if self.busy_of(tog):
+            self.msg = C["dim"] + "already working on that" + C["reset"]
+            return
+        if self.locked(tog):
+            owner = self.group_owner(tog["group"])
+            label = next((f["label"] for f in self.toggles() if f["id"] == owner), owner)
+            self.msg = "%s%s is busy%s - locked until it finishes" % (
+                C["yellow"], label, C["reset"])
+            return
+        target = "off" if tog["status"] in ("on", "partial") else "on"
+        # Mark it at once; the daemon's next document overrides this guess.
+        self.overlay[tog["id"]] = (target, time.time())
+        send("set %s %s" % (tog["id"], target))
+
+    def toggle_cfg(self, key):
+        cur = self.doc.get("config", {}).get(key, 0)
+        send("cfg %s %d" % (key, 0 if cur else 1))
+
+    # ----------------------------------------------------------------- rows
+    def build(self):
+        rows = []
+        if self.screen == "model":
+            active = self.llm_active()
+            for name, p in self.llm_profiles():
+                model = os.path.basename(p.get("model", ""))
+                # The quant is the informative part of these filenames and the
+                # only bit that fits; the rest is the model name, already the
+                # row label.
+                quant = model.replace(".gguf", "").split("-")[-1] if model else "?"
+                detail = "%-9s ctx %-7s" % (quant[:9], p.get("ctx", "?"))
+                mark = (C["green"] + " * loaded" + C["reset"]) if name == active else ""
+                rows.append(Row("%-13s %s%s%s%s" % (name, C["dim"], detail, C["reset"], mark),
+                                action=(lambda n=name: self.pick_profile(n))))
+            if not rows:
+                rows.append(Row("no profiles in the config file", heading=True))
+        elif self.screen == "config":
+            cfg = self.doc.get("config", {}) if self.doc else {}
+            # Composite parents only. A feature can have children merely for
+            # grouping -- web search under the LLM -- and for those the
+            # "<parent> turns on" keys mean nothing, because only a composite
+            # consults them when deciding what to start.
+            for parent in [f for f in self.toggles()
+                           if f.get("composite")
+                           and any(c["parent"] == f["id"] for c in self.toggles())]:
+                rows.append(Row("", heading=True))
+                rows.append(Row(parent["label"].lower() + " turns on", heading=True))
+                for f in self.toggles():
+                    if f["parent"] != parent["id"]:
+                        continue
+                    key = "%s_%s" % (f["parent"], f["id"])
+                    rows.append(Row(f["label"], "on" if cfg.get(key) else "off",
+                                    action=(lambda k=key: self.toggle_cfg(k))))
+        else:
+            # No Daemon row: its state is already in the header, and having it
+            # one enter-press away in the list is how you stop it by accident.
+            # It lives on its own key instead, guarded by a confirmation.
+            if self.doc:
+                # Sections come from the features themselves and are shown in
+                # the order they first appear, which is filename order -- so
+                # rearranging the menu is a rename, not a code change.
+                seen = []
+                for f in self.toggles():
+                    sec = f.get("section") or f.get("category", "")
+                    if sec not in seen:
+                        seen.append(sec)
+                for section in seen:
+                    tops = [f for f in self.toggles()
+                            if not f["parent"] and (f.get("section")
+                                                    or f.get("category", "")) == section]
+                    if not tops:
+                        continue
+                    members = [f for f in self.toggles()
+                               if (f.get("section") or f.get("category", "")) == section]
+                    rows.append(Row("", heading=True))
+                    # Say so once per section rather than on every row, and only
+                    # where it is true: a section nobody can use right now.
+                    suffix = ("" if all(m.get("available", True) for m in members)
+                              else "  (unavailable)")
+                    rows.append(Row(section + suffix, heading=True))
+                    for f in tops:
+                        rows.append(Row(f["label"], self.display_state(f),
+                                        locked=self.locked(f), tid=f["id"],
+                                        timer=self.timer_of(f),
+                                        forced=bool(f.get("forced")),
+                                        action=(lambda x=f: self.flip(x))))
+                        for child in self.toggles():
+                            if child["parent"] != f["id"]:
+                                continue
+                            rows.append(Row("  " + child["label"],
+                                            self.display_state(child),
+                                            locked=self.locked(child),
+                                            tid=child["id"],
+                                            timer=self.timer_of(child),
+                                            forced=bool(child.get("forced")),
+                                            action=(lambda x=child: self.flip(x))))
+        # Digits are positional and global, and skip rows that carry a fixed key.
+        n = 0
+        for r in rows:
+            if r.selectable and not r.key:
+                n += 1
+                if n <= 9:
+                    r.digit = n
+        self.rows = rows
+        picks = self.selectable_indexes()
+        if not picks:
+            self.cursor = 0
+            return
+        # Start on the first toggle, never on the daemon row: enter is one
+        # keypress away and stopping the daemon is not a small mistake.
+        if not self.cursor_placed:
+            for idx, pick in enumerate(picks):
+                if not rows[pick].key:
+                    self.cursor = idx
+                    self.cursor_placed = True
+                    break
+        self.cursor = min(max(self.cursor, 0), len(picks) - 1)
+
+    def selectable_indexes(self):
+        return [i for i, r in enumerate(self.rows) if r.selectable]
+
+    # --------------------------------------------------------------- render
+    def render(self):
+        self.build()
+        picks = self.selectable_indexes()
+        current = picks[self.cursor] if picks else -1
+        out = [""]
+        if self.screen == "model":
+            out.append("  %svibecontrol%s %s>%s %smodel%s"
+                       % (C["bold"], C["reset"], C["dim"], C["reset"], C["bold"], C["reset"]))
+            out.append("  " + C["dim"] + "enter reloads the server with that model" + C["reset"])
+        elif self.screen == "config":
+            out.append("  %svibecontrol%s %s>%s %sconfig%s"
+                       % (C["bold"], C["reset"], C["dim"], C["reset"], C["bold"], C["reset"]))
+            out.append("  " + C["dim"] + "behaviour, not live state" + C["reset"])
+            auto = self.auto_presets()
+            bits = [("at boot", auto.get("on_boot")), ("on resume", auto.get("on_resume"))]
+            bits = ["%s: %s" % (w, n) for w, n in bits if n]
+            if bits:
+                out.append("  " + C["dim"] + "applied automatically  "
+                           + "   ".join(bits) + C["reset"])
+        else:
+            dot = (C["green"] + "●" + C["reset"] + " running") if self.doc \
+                else (C["dim"] + "○" + C["reset"] + " stopped")
+            if self.doc:
+                dot += C["dim"] + ("  desktop" if self.graphical() else "  headless") + C["reset"]
+            out.append("  %svibecontrol%s%sdaemon %s" % (C["bold"], C["reset"], " " * 18, dot))
+            out.append("  " + C["dim"] + "─" * 46 + C["reset"])
+        out.append("")
+        body = [r.render(i == current) for i, r in enumerate(self.rows)]
+        header, cells = (self.preset_matrix()
+                         if self.screen == "main" else ([], []))
+        if header:
+            for h in header:
+                out.append(" " * LEFT_COL + h)
+            pairs = list(zip(body, cells))
+            for lhs, rhs in pairs:
+                pad = max(0, LEFT_COL - vis_len(lhs))
+                out.append((lhs + " " * pad + rhs).rstrip() if rhs else lhs)
+        else:
+            out.extend(body)
+        if self.screen != "config" and not self.doc:
+            out.append("")
+            out.append("      " + C["dim"] + "daemon not running - press d to start it" + C["reset"])
+        out.append("")
+        if self.screen in ("config", "model"):
+            out.append("   %sb%s  back" % (C["cyan"], C["reset"]))
+        else:
+            keys = []
+            if self.doc and self.doc.get("config"):
+                keys.append("%sc%s  config" % (C["cyan"], C["reset"]))
+            if self.llm_profiles():
+                keys.append("%sm%s  model" % (C["cyan"], C["reset"]))
+            keys.append("%sr%s  restart daemon" % (C["cyan"], C["reset"]))
+            keys.append("%sd%s  daemon" % (C["cyan"], C["reset"]))
+            out.append("   " + "    ".join(keys))
+        out.append("   %sx%s  quit" % (C["cyan"], C["reset"]))
+        out.append("   " + C["dim"]
+                   + ("j/k move   enter load" if self.screen == "model"
+                      else "j/k move   enter toggle") + C["reset"])
+        out.append("")
+        # A note from a running task wins over whatever message is sitting
+        # there: it is the newer fact, and the stale one is usually "applying
+        # 2" from the preset that started this.
+        note = self.busy_note()
+        if note:
+            out.append("  " + C["dim"] + note + C["reset"])
+        elif self.msg:
+            # A leading ! marks a daemon message that reports a failure.
+            if self.msg.startswith("!"):
+                out.append("  " + C["red"] + C["bold"] + self.msg[1:] + C["reset"])
+            else:
+                out.append("  " + self.msg)
+            out.append("")
+        return "\n".join(out)
+
+    def paint(self):
+        frame = self.render()
+        if frame != self.last_frame:
+            sys.stdout.write("\033[H\033[2J" + frame + "\n")
+            sys.stdout.flush()
+            self.last_frame = frame
+
+    # ----------------------------------------------------------------- keys
+    def move(self, delta):
+        picks = self.selectable_indexes()
+        if picks:
+            self.cursor = max(0, min(len(picks) - 1, self.cursor + delta))
+
+    def activate(self):
+        picks = self.selectable_indexes()
+        if picks:
+            self.rows[picks[self.cursor]].action()
+
+    def on_key(self, ch):
+        armed_daemon = self.daemon_armed
+        armed_preset = self.preset_armed
+        self.daemon_armed = False
+        self.preset_armed = None
+        self.msg = ""
+        if ch in ("j", "down"):
+            self.move(1)
+            return True
+        if ch in ("k", "up"):
+            self.move(-1)
+            return True
+        if ch == "home":
+            self.cursor = 0
+            return True
+        if ch == "end":
+            self.cursor = max(0, len(self.selectable_indexes()) - 1)
+            return True
+        if ch in ("\r", "\n", " "):
+            self.activate()
+            return True
+        if ch == "x":
+            return False
+        if ch == "d" and self.screen == "main":
+            if not self.doc:
+                daemon_start()          # starting it is harmless, just do it
+                return True
+            if not armed_daemon:
+                self.daemon_armed = True
+                self.msg = ("%sStop the daemon?%s every toggle stops being "
+                            "controllable - press %sd%s again"
+                            % (C["yellow"], C["reset"], C["cyan"], C["reset"]))
+            else:
+                daemon_stop()
+            return True
+        if self.screen == "main" and ch in self.preset_keys:
+            name = self.preset_keys[ch]
+            wanted = self.presets().get(name, {})
+            changes = [t for t, v in wanted.items()
+                       if self.status_of(t) not in (None, v)]
+            if not changes:
+                self.msg = C["dim"] + "%s: already applied" % name + C["reset"]
+            elif armed_preset != name:
+                self.preset_armed = name
+                self.msg = ("apply %s%s%s? changes %s - press %s%s%s again"
+                            % (C["bold"], name, C["reset"], ", ".join(changes),
+                               C["cyan"], ch, C["reset"]))
+            else:
+                send("preset %s" % name)
+            return True
+        if ch == "r" and self.screen == "main":
+            # Restart rather than reload: this is the "I edited something on
+            # disk, start over" key. The daemon turns nothing off when it
+            # stops, so a restart costs only the moment it is down.
+            daemon_restart()
+            send("hello %d" % os.getpid())
+            self.msg = C["dim"] + "daemon restarted" + C["reset"]
+            return True
+        if ch == "c" and self.screen == "main":
+            if self.doc and self.doc.get("config"):
+                self.screen = "config"
+                self.cursor = 0
+                self.cursor_placed = True
+            elif not self.doc:
+                self.msg = C["dim"] + "start the daemon first" + C["reset"]
+            else:
+                self.msg = C["dim"] + "nothing to configure" + C["reset"]
+            return True
+        if ch in ("b", "\x1b") and self.screen in ("config", "model"):
+            self.screen = "main"
+            self.cursor_placed = False
+            return True
+        if ch == "m" and self.screen == "main":
+            if not self.llm_profiles():
+                self.msg = C["dim"] + "no model profiles configured" + C["reset"]
+            else:
+                self.screen = "model"
+                self.cursor = 0
+                self.cursor_placed = True
+            return True
+        if ch.isdigit() and ch != "0":
+            for r in self.rows:
+                if r.digit == int(ch):
+                    r.action()
+                    break
+            return True
+        return True
+
+
+def main():
+    os.makedirs(CLIENTS, exist_ok=True)
+    fifo = os.path.join(CLIENTS, "%d.fifo" % os.getpid())
+    try:
+        os.mkfifo(fifo, 0o600)
+    except FileExistsError:
+        pass
+    # Read-write so the daemon's wake-up write never blocks on us.
+    notify = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+
+    ui = UI()
+    ui.adopt(read_state())
+    send("hello %d" % os.getpid())
+
+    old = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        while True:
+            ui.paint()
+            # Blocks on both the keyboard and the daemon's wake fifo, so an
+            # idle client costs nothing. The timeout only bounds how long a
+            # local guess can linger if the daemon never answers.
+            # A second while a task is running, so its timer advances; back
+            # to two when idle. Neither is a poll of the daemon -- the document
+            # arrives on the notify fifo either way, this only decides how
+            # often an already-known elapsed time is redrawn.
+            tick = 1.0 if ui.anything_busy() else 2.0
+            ready, _, _ = select.select([STDIN, notify], [], [], tick)
+            if notify in ready:
+                try:
+                    os.read(notify, 4096)
+                except OSError:
+                    pass
+                ui.adopt(read_state())
+            if STDIN in ready:
+                if not ui.on_key(read_key()):
+                    break
+            if not ready:
+                ui.expire_overlay()
+                if ui.doc is None or not os.path.isdir("/proc/%d" % ui.doc["daemon"]["pid"]):
+                    ui.adopt(read_state())
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        send("bye %d" % os.getpid())
+        os.close(notify)
+        try:
+            os.unlink(fifo)
+        except OSError:
+            pass
+        sys.stdout.write("\033[H\033[2J")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+category="common"
+label="SSH daemon"
+group="sshd"
+section="server"
+# As with the hotspot: rolling back a failed "on" would stop sshd, and this is
+# how the machine is reached when it has no desktop.
+on_timeout=force
+t_status() { [[ $(systemctl is-active sshd 2>/dev/null) == active ]] && echo on || echo off; }
+# No pkexec: /etc/polkit-1/rules.d/49-vibecontrol-sshd.rules lets this user
+# start and stop sshd without authentication. That matters beyond convenience
+# -- pkexec needs a polkit agent, which is a desktop component, so using it
+# here would stop this toggle working headless and contradict category=common.
+t_on()     { systemctl start sshd >/dev/null 2>&1; }
+t_off()    { systemctl stop  sshd >/dev/null 2>&1; }

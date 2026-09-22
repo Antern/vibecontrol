@@ -1,0 +1,13 @@
+category="common"
+label="Stay awake"
+group="awake"
+section="server"
+_unit="vibecontrol-stay-awake"
+t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
+t_on() {
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    systemd-run --user --unit="$_unit" --description="ctl: keep awake while server mode is active" \
+        systemd-inhibit --what=sleep:idle --who="ctl server mode" \
+            --why="Server mode is active" --mode=block sleep infinity >/dev/null 2>&1
+}
+t_off() { systemctl --user stop "$_unit" >/dev/null 2>&1; }

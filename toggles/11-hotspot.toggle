@@ -1,0 +1,14 @@
+category="common"
+label="Hotspot"
+group="hotspot"
+section="server"
+timeout=60
+# Never rollback: this link carries the SSH session the machine is often being
+# driven over, and rolling back a failed "on" means taking it down. Forcing
+# just tries again, which is the only safe direction here.
+on_timeout=force
+t_status() { [[ $(nmcli -g GENERAL.STATE con show Hotspot 2>/dev/null) == activated ]] && echo on || echo off; }
+# -w bounds nmcli inside the task deadline; its own default is 90s, which
+# would let the daemon kill the task while NetworkManager was still working.
+t_on()     { nmcli -w 40 con up   Hotspot >/dev/null 2>&1; }
+t_off()    { nmcli -w 40 con down Hotspot >/dev/null 2>&1; }

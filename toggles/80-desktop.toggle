@@ -1,0 +1,212 @@
+category="common"
+label="Desktop (Plasma)"
+group="desktop"
+section="desktop"
+defer_off=1
+# ...and defer_on too. The desktop consumes what the other features release:
+# starting Plasma while the LLM still holds 14 GB of VRAM gets a Wayland session
+# that opens and dies in the same second, because kwin cannot get the GPU.
+# Deferring both directions means the desktop is always last to take memory and
+# last to give the others back their environment.
+defer_on=1
+timeout=90
+on_timeout=force
+_unit="plasmalogin.service"
+_greeter_user="plasmalogin"
+_watch="$ROOT/lib/unit-watch.py"
+
+# Off drops the machine to a text console: the Plasma session and the greeter
+# both go away, freeing roughly 1 GB of VRAM (plasmashell alone is ~760 MB) for
+# local LLM work. On brings the session back via autologin.
+#
+# category is "common", not "wm", on purpose. A "wm" toggle reports itself
+# unavailable the moment the desktop is down -- which is exactly when this one
+# still has to be usable, from SSH, to get the desktop back.
+#
+# Stopping the login manager rather than just graphical-session.target is also
+# on purpose: plasmalogin would otherwise put up the greeter, which is itself a
+# Wayland compositor holding VRAM, and most of the saving would be lost.
+#
+# Privileges come from /etc/polkit-1/rules.d/50-vibecontrol-desktop.rules
+# (install/desktop-privileges.sh), not pkexec -- pkexec needs a polkit agent,
+# which is a desktop component.
+
+t_status() { [[ $(systemctl is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
+
+# Stopping the login manager is not enough on its own. When the session ends,
+# the manager puts up a greeter, and logind starts a SEPARATE user manager for
+# it -- user@<uid>.service, which is not in plasmalogin.service's control group
+# and so survives stopping it. That greeter is a full Wayland compositor:
+# kwin_wayland, plasma-login-greeter and a wallpaper process, worth most of the
+# VRAM this toggle exists to reclaim. It has to be stopped explicitly.
+_stop_greeter() {
+    local uid
+    uid=$(id -u "$_greeter_user" 2>/dev/null) || return 0
+    [[ -n $uid ]] || return 0
+    [[ $(systemctl is-active "user@$uid.service" 2>/dev/null) == active ]] || return 0
+    vc_progress "stopping the greeter session"
+    systemctl stop "user@$uid.service" >/dev/null 2>&1
+}
+
+# A session whose leader process is gone but which still owns seat0. logind
+# leaves these behind when the login manager is stopped while a greeter session
+# is mid-spawn: the scope never empties because an orphaned startplasma process
+# outlives it. Nothing else can claim the seat afterwards, so a later start
+# fails, systemd retries, and the restart limiter latches -- which looks like
+# the login manager being broken rather than the seat being occupied.
+#
+# Clearing one needs root, so this only reports. The message names the fix.
+_stale_seat() {
+    local sid leader
+    while read -r sid; do
+        [[ -n $sid ]] || continue
+        [[ $(loginctl show-session "$sid" -p Seat --value 2>/dev/null) == seat0 ]] || continue
+        leader=$(loginctl show-session "$sid" -p Leader --value 2>/dev/null)
+        [[ -n $leader && -d /proc/$leader ]] && continue
+        printf '%s\n' "$sid"
+        return 0
+    done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}')
+    return 1
+}
+
+# defer_on makes the desktop start only after the other features' tasks have
+# returned, but a task returning is not the same as the GPU being free: stopping
+# a model server returns when the process exits, and the driver hands the memory
+# back slightly later. kwin needs a few hundred MB and fails outright without
+# them, so wait for the memory itself rather than trusting the ordering.
+_wait_vram() {
+    local need=$((700 * 1024 * 1024)) i free card=/sys/class/drm/card1/device
+    [[ -r $card/mem_info_vram_total ]] || return 0      # no card, nothing to wait for
+    for i in $(seq 1 30); do
+        free=$(( $(cat "$card/mem_info_vram_total") - $(cat "$card/mem_info_vram_used") ))
+        (( free >= need )) && return 0
+        [[ $i == 1 ]] && vc_progress "waiting for the GPU to be released"
+        sleep 1
+    done
+    return 0    # proceed anyway: a full card is worth reporting through the
+                # session failing, not through refusing to try
+}
+
+# True once the greeter has finished coming up: its user manager is running and
+# its session has a live leader. Stopping the login manager before this is what
+# leaves a session whose leader dies while its scope still owns seat0 -- the
+# corpse that blocks the next start and needs root to clear.
+_greeter_settled() {
+    local uid sid leader
+    uid=$(id -u "$_greeter_user" 2>/dev/null) || return 0
+    [[ $(systemctl is-active "user@$uid.service" 2>/dev/null) == active ]] || return 1
+    while read -r sid; do
+        [[ -n $sid ]] || continue
+        [[ $(loginctl show-session "$sid" -p Name --value 2>/dev/null) == "$_greeter_user" ]] || continue
+        leader=$(loginctl show-session "$sid" -p Leader --value 2>/dev/null)
+        [[ -n $leader && -d /proc/$leader ]] && return 0
+    done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}')
+    return 1
+}
+
+# Signal-driven, not a sleep loop: unit-watch subscribes to the user manager
+# and returns the moment the target changes state.
+_session_gone() { "$_watch" --timeout "${1:-35}" graphical-session.target inactive; }
+_session_up()   { "$_watch" --timeout "${1:-40}" graphical-session.target active; }
+
+# Units to leave running: the daemon itself, and the toggles that are supposed
+# to keep working with no desktop around.
+_keep=" vibecontrol-daemon.service vibecontrol-stay-awake.service "
+
+# The applications a real shutdown asks to quit. systemd names desktop-launched
+# programs app-*, which covers Konsole, Firefox, Telegram and the autostarts.
+# vibecontrol's own long-lived units are not app-* scopes and carry no PartOf,
+# so nothing else would ever stop them -- they are listed too.
+_session_apps() {
+    local u
+    while read -r u _; do
+        case $u in
+            app-*)         ;;
+            vibecontrol-*) [[ $_keep == *" $u "* ]] && continue ;;
+            *)             continue ;;
+        esac
+        printf '%s\n' "$u"
+    done < <(systemctl --user list-units --state=active --plain --no-legend \
+                 --type=service --type=scope 2>/dev/null)
+}
+
+# Starting the login manager is enough to get the session back: Autologin fires
+# for the first session of a freshly started manager, and this stopped it
+# entirely rather than logging out of it.
+#
+# Waits for the session to actually exist before reporting success. A preset
+# that turns the desktop on usually also wants wm toggles set, and those are
+# skipped while graphical-session.target is down -- so returning early would
+# silently drop half the preset.
+t_on() {
+    local stale
+    if stale=$(_stale_seat); then
+        printf 'seat0 still held by dead session %s; run: sudo loginctl terminate-session %s' \
+            "$stale" "$stale"
+        return 1
+    fi
+    _wait_vram
+    vc_progress "starting the login manager"
+    systemctl start "$_unit" >/dev/null 2>&1 || return 1
+    vc_progress "waiting for the session to come up"
+    _session_up 40
+}
+
+# Off reuses Plasma's own shutdown flow rather than imitating it. org.kde.Shutdown
+# logout is the method the "Log Out" menu entry calls, and the same one "Shut
+# Down" calls before it powers the machine off: ksmserver asks every application
+# to save and close, gives them their chance to object, and tears the session
+# down in the right order. The only difference here is that the machine stays on.
+#
+# The login manager is stopped afterwards, because a logout on its own just
+# leaves the greeter -- itself a Wayland compositor holding VRAM. If the logout
+# does not complete, the applications are stopped directly instead, so this
+# never leaves the desktop half torn down.
+#
+# SSH logins live in user.slice/session-N.scope, so none of this touches them.
+t_off() {
+    local units
+    vc_progress "asking Plasma to log out"
+    if ! { busctl --user call org.kde.Shutdown /Shutdown org.kde.Shutdown logout \
+               >/dev/null 2>&1 && _session_gone 35; }; then
+        vc_progress "logout did not finish - stopping applications"
+        units=$(_session_apps)
+        # shellcheck disable=SC2086
+        [[ -n $units ]] && systemctl --user stop $units >/dev/null 2>&1
+    fi
+    # The manager puts a greeter up the instant the session ends. Take it down
+    # once it exists rather than while it is being built -- see _greeter_settled.
+    local i
+    vc_progress "letting the greeter settle"
+    for i in $(seq 1 10); do _greeter_settled && break; sleep 1; done
+
+    vc_progress "stopping the login manager"
+    systemctl stop "$_unit" >/dev/null 2>&1 || return 1
+    _stop_greeter
+    _session_gone 20 || return 1
+    # Reported rather than failed: the memory this feature exists to free has
+    # been freed either way, and the consequence lands on the next start, which
+    # refuses with the same session id and the command to clear it.
+    local stale
+    stale=$(_stale_seat) && vc_progress "warning: seat0 still held by dead session $stale"
+    return 0
+}
+
+# Runs when t_off overran the daemon's timeout and was killed. No more asking:
+# stop the applications, then the login manager.
+t_force() {
+    local want="$1" units
+    if [[ $want == on ]]; then
+        systemctl start "$_unit" >/dev/null 2>&1 || return 1
+        _session_up 40
+        return
+    fi
+    vc_progress "forcing: stopping applications"
+    units=$(_session_apps)
+    # shellcheck disable=SC2086
+    [[ -n $units ]] && systemctl --user stop $units >/dev/null 2>&1
+    vc_progress "forcing: stopping the login manager"
+    systemctl stop "$_unit" >/dev/null 2>&1 || return 1
+    _stop_greeter
+    _session_gone 20
+}

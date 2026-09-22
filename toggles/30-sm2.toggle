@@ -1,0 +1,38 @@
+category="wm"
+label="SM2 macro"
+group="sm2"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+_unit="vibecontrol-sm2-anchor"
+_helper="/usr/local/libexec/sm2-macro-root-helper"
+t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
+# The helper watches a pid and stops the preset when it dies. systemd owns the
+# anchor pid, so it is addressable and survives the terminal closing.
+t_on() {
+    local anchor="" i
+    [[ -x $_helper ]] || return 2
+    systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    systemd-run --user --unit="$_unit" --description="ctl: SM2 macro anchor" \
+        sleep infinity >/dev/null 2>&1 || return 1
+    for ((i = 0; i < 20; i++)); do
+        anchor=$(systemctl --user show -p MainPID --value "$_unit" 2>/dev/null)
+        [[ -n $anchor && $anchor != 0 ]] && break
+        sleep 0.05
+    done
+    [[ -n $anchor && $anchor != 0 ]] || { systemctl --user stop "$_unit" >/dev/null 2>&1; return 1; }
+    setsid pkexec "$_helper" "$anchor" >/dev/null 2>&1 </dev/null &
+    # Settle once pkexec has exec'd into the helper; its own cmdline also names
+    # the helper, so entries still showing "pkexec" are skipped.
+    for ((i = 0; i < 150; i++)); do
+        for p in $(pgrep -f "sm2-macro-root-helper $anchor" 2>/dev/null); do
+            [[ $(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null) == pkexec* ]] && continue
+            return 0
+        done
+        pgrep -f "pkexec .*sm2-macro-root-helper $anchor" >/dev/null 2>&1 || { (( i > 6 )) && break; }
+        sleep 0.08
+    done
+    systemctl --user stop "$_unit" >/dev/null 2>&1
+    return 1
+}
+t_off() { systemctl --user stop "$_unit" >/dev/null 2>&1; }

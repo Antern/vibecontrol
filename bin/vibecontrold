@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+#
+# vibecontrold - owns all feature state.
+#
+# Clients never run feature work themselves: they send one-line commands on a
+# fifo and render state.json. That document carries the feature descriptors
+# AND the lock topology, so a client learns at init which entries block each
+# other and never hardcodes it. The daemon enforces the same lock regardless,
+# so a stale client cannot cause concurrent work.
+#
+# Nothing polls. A finishing task wakes the daemon by writing into the command
+# fifo it is already blocked on -- bash runs a trap handler but does NOT
+# interrupt a blocking read, so signalling cannot wake it.
+
+set -uo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+ROOT=$(dirname "$(dirname "$SELF")")
+CONV="$ROOT/lib/state2json.py"
+
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vibecontrol"
+CFG="$CFG_DIR/config"
+TOG_DIR="$CFG_DIR/toggles"
+RUN="${XDG_RUNTIME_DIR:-/tmp}/vibecontrol"
+FIFO="$RUN/cmd"
+STATE="$RUN/state.json"
+CLIENTS="$RUN/clients"
+TASKS="$RUN/tasks"
+
+MSG=""
+# Set when a preset could not finish in one pass; replayed from reap_tasks.
+PENDING_PRESET=""
+
+mkdir -p "$RUN" "$CLIENTS" "$TASKS" 2>/dev/null
+rm -f "$TASKS"/*.result "$TASKS"/*.tmp 2>/dev/null
+[[ -p $FIFO ]] || { rm -f "$FIFO"; mkfifo -m 600 "$FIFO"; }
+
+# ------------------------------------------------------------------ config --
+# Derived from the loaded features rather than hardcoded, so adding or
+# removing a feature file cannot leave a stale key behind.
+CFG_KEYS=()
+build_cfg_keys() {
+    local id
+    CFG_KEYS=()
+    for id in "${TOGGLE_IDS[@]}"; do
+        [[ -n ${T_PARENT[$id]} ]] && CFG_KEYS+=("${T_PARENT[$id]}_$id")
+    done
+}
+cfg_default() {
+    # <parent>_<child>: whether a child comes up with its composite parent.
+    echo 1
+}
+cfg_get() {
+    local v
+    v=$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2)
+    if [[ $v == 0 || $v == 1 ]]; then echo "$v"; else cfg_default "$1"; fi
+}
+# Free-text settings, as opposed to the 0/1 toggles cfg_get handles.
+cfg_text() { grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2-; }
+cfg_set() {
+    mkdir -p "$CFG_DIR" 2>/dev/null; touch "$CFG" 2>/dev/null
+    if grep -qE "^$1=" "$CFG" 2>/dev/null; then sed -i "s/^$1=.*/$1=$2/" "$CFG"
+    else printf '%s=%s\n' "$1" "$2" >>"$CFG"; fi
+}
+
+# ----------------------------------------------------------------- session --
+# Whether a desktop session exists at all. graphical-session.target is the
+# generic systemd signal every desktop sets, so this works for KDE, GNOME,
+# sway and so on -- nothing here knows about any particular desktop. Set
+# VIBECONTROL_ASSUME_HEADLESS=1 to exercise the headless path.
+GRAPHICAL=0
+detect_session() {
+    if [[ ${VIBECONTROL_ASSUME_HEADLESS:-0} == 1 ]]; then GRAPHICAL=0; return; fi
+    [[ $(systemctl --user is-active graphical-session.target 2>/dev/null) == active ]] \
+        && GRAPHICAL=1 || GRAPHICAL=0
+}
+# A wm feature is unusable with no desktop around; a common one always works.
+available() {
+    [[ ${T_CAT[$1]} != wm ]] || (( GRAPHICAL ))
+}
+
+# ----------------------------------------------------------------- toggles --
+TOGGLE_IDS=()
+declare -A T_FILE=() T_LABEL=() T_KEY=() T_PARENT=() T_GROUP=() T_COMP=() T_PREFIX=() T_CAT=() T_DEFER=() T_DEFER_ON=() T_TIMEOUT=() T_ONTIME=() T_SECTION=()
+declare -A STATUS=() INFLIGHT=() TASK_PID=() GROUP_BUSY=() GROUP_OWNER=()
+# When each task started, and what it last said about itself. Both are
+# published so a client can show a timer and a line of progress.
+declare -A BUSY_SINCE=() BUSY_NOTE=() TASK_FORCED=()
+
+load_toggles() {
+    local f id meta
+    for f in "$TOG_DIR"/*.toggle; do
+        [[ -f $f ]] || continue
+        id=$(basename "$f" .toggle); id=${id#*-}
+        # Metadata is read in a subshell so a feature's variables cannot leak
+        # into the daemon or into the next feature file.
+        meta=$( set +u; source "$f" 2>/dev/null
+                printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+                    "${label:-$id}" "${key:-}" "${parent:-}" \
+                    "${group:-$id}" "${composite:-0}" "${child_cfg_prefix:-}" \
+                    "${category:-common}" "${defer_off:-0}" \
+                    "${timeout:-30}" "${on_timeout:-rollback}" \
+                    "${defer_on:-0}" "${section:-}" )
+        TOGGLE_IDS+=("$id")
+        T_FILE[$id]="$f"
+        T_LABEL[$id]=$(sed -n 1p <<<"$meta")
+        T_KEY[$id]=$(sed -n 2p <<<"$meta")
+        T_PARENT[$id]=$(sed -n 3p <<<"$meta")
+        T_GROUP[$id]=$(sed -n 4p <<<"$meta")
+        T_COMP[$id]=$(sed -n 5p <<<"$meta")
+        T_PREFIX[$id]=$(sed -n 6p <<<"$meta")
+        T_CAT[$id]=$(sed -n 7p <<<"$meta")
+        T_DEFER[$id]=$(sed -n 8p <<<"$meta")
+        T_TIMEOUT[$id]=$(sed -n 9p <<<"$meta")
+        T_ONTIME[$id]=$(sed -n 10p <<<"$meta")
+        T_DEFER_ON[$id]=$(sed -n 11p <<<"$meta")
+        T_SECTION[$id]=$(sed -n 12p <<<"$meta")
+        GROUP_BUSY[${T_GROUP[$id]}]=0
+        GROUP_OWNER[${T_GROUP[$id]}]=""
+    done
+}
+# Re-sourcing per call gives perfect isolation: private variables such as
+# _unit cannot collide between features.
+# Called by toggle scripts, which run in a subshell of this one and so inherit
+# it. The note is written to a file and the daemon nudged through the fifo, so
+# the text reaches clients while the task is still running and nothing blocks.
+vc_progress() {
+    [[ -n ${VC_NOTE:-} ]] || return 0
+    printf '%s' "$*" >"$VC_NOTE.tmp" 2>/dev/null && mv -f "$VC_NOTE.tmp" "$VC_NOTE"
+    printf 'note %s\n' "${VC_ID:-}" >"$FIFO" 2>/dev/null
+    return 0
+}
+
+# Toggles call vc_progress to say where they have got to. Long teardowns are
+# otherwise a yellow cell and no explanation; this is what makes them legible.
+# The note lands in a file the daemon reads when the task wakes it, so nothing
+# here blocks and a toggle that never calls it behaves exactly as before.
+toggle_call() {
+    ( set +u; source "${T_FILE[$1]}" 2>/dev/null
+      declare -F "t_$2" >/dev/null || exit 3
+      "t_$2" )
+}
+children_of() {
+    local id
+    for id in "${TOGGLE_IDS[@]}"; do [[ ${T_PARENT[$id]} == "$1" ]] && printf '%s\n' "$id"; done
+}
+comp_status() {
+    local parent="$1"
+    # NB: bash declares every name in a `local` before running the
+    # assignments, so pre= cannot reference parent= from the same statement.
+    local c active=0 ok=1 pre="${T_PREFIX[$parent]}"
+    while read -r c; do
+        [[ -z $c ]] && continue
+        [[ ${STATUS[$c]} == on ]] && active=1
+        [[ $(cfg_get "${pre}${c}") == 1 && ${STATUS[$c]} != on ]] && ok=0
+    done < <(children_of "$parent")
+    if (( ! active )); then echo off; elif (( ok )); then echo on; else echo partial; fi
+}
+refresh_status() {
+    local id
+    detect_session
+    for id in "${TOGGLE_IDS[@]}"; do
+        [[ ${T_COMP[$id]} == 1 ]] && continue
+        # Do not probe a feature whose backend is not there; it would hang or
+        # report nonsense.
+        if available "$id"; then
+            STATUS[$id]=$(toggle_call "$id" status)
+            [[ ${STATUS[$id]} == on ]] || STATUS[$id]=off
+        else
+            STATUS[$id]=off
+        fi
+    done
+    for id in "${TOGGLE_IDS[@]}"; do
+        [[ ${T_COMP[$id]} == 1 ]] && STATUS[$id]=$(comp_status "$id")
+    done
+}
+
+# ------------------------------------------------------------------- state --
+write_state() {
+    local i=0 id g k b
+    {
+        echo "daemon_pid=$$"
+        echo "msg=$MSG"
+        echo "graphical=$GRAPHICAL"
+        for id in "${TOGGLE_IDS[@]}"; do
+            i=$((i + 1))
+            echo "t.$i.id=$id"
+            echo "t.$i.label=${T_LABEL[$id]}"
+            echo "t.$i.key=${T_KEY[$id]}"
+            echo "t.$i.parent=${T_PARENT[$id]}"
+            echo "t.$i.group=${T_GROUP[$id]}"
+            echo "t.$i.composite=${T_COMP[$id]}"
+            echo "t.$i.category=${T_CAT[$id]}"
+            echo "t.$i.section=${T_SECTION[$id]:-${T_CAT[$id]}}"
+            echo "t.$i.available=$(available "$id" && echo 1 || echo 0)"
+            echo "t.$i.status=${STATUS[$id]:-off}"
+            # force-off is still an off as far as a client is concerned; the
+            # escalation is reported separately so it can be shown as such.
+            # Copied out first: ${A[k]:-} and ${A[k]#pat} cannot be combined,
+            # and an unset key under set -u kills this whole subshell silently.
+            b="${INFLIGHT[$id]:-}"
+            # restart ends in on, and force-X ends in X: clients only care
+            # about the destination, so they are told that.
+            [[ $b == restart ]] && b=on
+            echo "t.$i.busy=${b#force-}"
+            echo "t.$i.forced=$([[ $b == force-* ]] && echo 1 || echo 0)"
+            echo "t.$i.busy_since=${BUSY_SINCE[$id]:-}"
+            echo "t.$i.timeout=${T_TIMEOUT[$id]:-30}"
+            echo "t.$i.note=${BUSY_NOTE[$id]:-}"
+        done
+        for g in "${!GROUP_BUSY[@]}"; do
+            echo "g.$g.busy=${GROUP_BUSY[$g]}"
+            echo "g.$g.owner=${GROUP_OWNER[$g]:-}"
+        done
+        for k in "${CFG_KEYS[@]}"; do echo "c.$k=$(cfg_get "$k")"; done
+        # Model profiles: named blocks of llm.profile.<name>.* in the same flat
+        # config. Published so a client can offer the list without knowing
+        # anything about models -- the daemon does not interpret them either,
+        # beyond which one is active.
+        echo "llm_profile=$(cfg_text llm.profile)"
+        while IFS= read -r line; do
+            [[ -n $line ]] && echo "lp.$line"
+        done < <(grep -oE '^llm\.profile\.[A-Za-z0-9_-]+\.(model|ctx|alias)=.*' "$CFG" 2>/dev/null \
+                 | sed 's/^llm\.profile\.//')
+        # presets live in the same flat config: preset.<name>.<toggle>=on|off.
+        # A toggle a preset does not mention is simply left alone.
+        while IFS= read -r line; do echo "p.${line#preset.}"; done \
+            < <(grep -E '^preset\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+=(on|off)$' "$CFG" 2>/dev/null)
+        # A preset the daemon applies itself -- on_boot, on_resume -- does not
+        # need a key in the menu. Marking it hidden keeps it working while
+        # taking it out of the matrix. The applier ignores this line because it
+        # only matches entries whose value is on or off.
+        while IFS= read -r line; do echo "ph.${line#preset.}"; done \
+            < <(grep -E '^preset\.[A-Za-z0-9_-]+\.hidden=1$' "$CFG" 2>/dev/null)
+        echo "on_boot=$(cfg_text on_boot)"
+        echo "on_resume=$(cfg_text on_resume)"
+    } | python3 "$CONV" >"$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE"
+    notify_clients
+}
+# Clients open their own fifo read-write, so these writes never block; the
+# timeout is a backstop for a client that died without unregistering.
+notify_clients() {
+    local c id
+    for c in "$CLIENTS"/*.fifo; do
+        [[ -p $c ]] || continue
+        id=$(basename "$c" .fifo)
+        if [[ -d /proc/$id ]]; then timeout 0.3 bash -c 'printf u > "$1"' _ "$c" 2>/dev/null
+        else rm -f "$c"; fi
+    done
+}
+
+# ------------------------------------------------------------------- tasks --
+run_target() {
+    local id="$1" target="$2" c rc pre started=0
+    if [[ ${T_COMP[$id]} == 1 ]]; then
+        pre="${T_PREFIX[$id]}"
+        if [[ $target == on ]]; then
+            while read -r c; do
+                [[ -z $c ]] && continue
+                [[ $(cfg_get "${pre}${c}") == 1 ]] && toggle_call "$c" on && started=1
+            done < <(children_of "$id")
+            (( started )) || { printf 'Nothing enabled for %s' "${T_LABEL[$id]}"; return 1; }
+        else
+            while read -r c; do
+                [[ -z $c ]] && continue
+                [[ $(toggle_call "$c" status) == on ]] && toggle_call "$c" off
+            done < <(children_of "$id")
+        fi
+    elif [[ $target == restart ]]; then
+        # Off then on, for when the feature's configuration changed rather than
+        # its desired state -- a different model, say. Failing the off half is
+        # not fatal: the point is to end up on.
+        toggle_call "$id" off >/dev/null 2>&1
+        toggle_call "$id" on; rc=$?
+        (( rc != 0 )) && { printf 'Could not restart %s' "${T_LABEL[$id]}"; return 1; }
+        printf '%s restarted' "${T_LABEL[$id]}"
+        return 0
+    elif [[ $target == force-* ]]; then
+        # The escalation after a deadline. A toggle that knows a harder way to
+        # get there provides t_force; otherwise the ordinary path is simply
+        # tried again, now that whatever was hanging has been killed.
+        local want="${target#force-}"
+        ( set +u; source "${T_FILE[$id]}" 2>/dev/null
+          if declare -F t_force >/dev/null; then t_force "$want"; else "t_$want"; fi )
+        rc=$?
+        (( rc != 0 )) && { printf 'Could not force %s %s' "${T_LABEL[$id]}" "$want"; return 1; }
+        printf '%s %s (forced)' "${T_LABEL[$id]}" "${want^^}"
+        return 0
+    else
+        toggle_call "$id" "$target"; rc=$?
+        (( rc == 2 )) && { printf '%s unavailable' "${T_LABEL[$id]}"; return 1; }
+        (( rc != 0 )) && { printf 'Could not turn %s %s' "${T_LABEL[$id]}" "$target"; return 1; }
+    fi
+    printf '%s %s' "${T_LABEL[$id]}" "${target^^}"
+}
+# A child feature exists because it serves its parent -- web search is only
+# reachable through the model server -- so switching the parent off switches
+# them off too, rather than leaving a backend running for nobody. Composites are
+# excluded: run_target already walks their children itself, and doing it twice
+# would fight over the same locks.
+#
+# Only a plain off cascades. A restart keeps children up on purpose: the parent
+# is coming straight back and there is no reason to tear down what it needs.
+cascade_off() {
+    local parent="$1" c
+    while read -r c; do
+        [[ -z $c ]] && continue
+        [[ ${STATUS[$c]:-off} == on ]] || continue
+        # A wm child goes away with the session it lives in, and refresh_status
+        # already reports it off once that happens. Stopping it here would race
+        # the parent's own teardown -- the desktop's graceful logout is already
+        # closing these -- so only common children are cascaded.
+        [[ ${T_CAT[$c]} == wm ]] && continue
+        [[ -n ${TASK_PID[$c]:-} ]] && continue
+        [[ ${GROUP_BUSY[${T_GROUP[$c]}]:-0} == 1 ]] && continue
+        start_task "$c" off
+    done < <(children_of "$parent")
+}
+
+start_task() {
+    local id="$1" target="$2"
+    local g="${T_GROUP[$id]}" rf="$TASKS/$id.result"
+    rm -f "$rf" "$rf.tmp" "$TASKS/$id.note"
+    INFLIGHT[$id]="$target"; GROUP_BUSY[$g]=1; GROUP_OWNER[$g]="$id"
+    BUSY_SINCE[$id]=$EPOCHSECONDS; BUSY_NOTE[$id]=""; TASK_FORCED[$id]=""
+    # Job control on for exactly this launch, so the task becomes a process
+    # group leader and killing -PID takes down whatever it spawned too: a
+    # systemctl stop still in flight must not complete behind the escalation's
+    # back. set -m inside the subshell would be the wrong side of the fork --
+    # it gives the task's children new groups, not the task itself.
+    set -m
+    (
+        export VC_NOTE="$TASKS/$id.note" VC_FIFO="$FIFO" VC_ID="$id"
+        m=$(run_target "$id" "$target" 2>/dev/null); r=$?
+        printf '%s\n%s' "$r" "$m" >"$rf.tmp"; mv -f "$rf.tmp" "$rf"
+        printf 'done %s\n' "$id" >"$FIFO"
+    ) >/dev/null 2>&1 &
+    TASK_PID[$id]=$!
+    set +m
+    [[ $target == off && ${T_COMP[$id]} != 1 ]] && cascade_off "$id"
+    return 0
+}
+# A finished task writes its result file BEFORE waking us, so checking for
+# result files just before blocking removes the wake race entirely.
+tasks_ready() {
+    local id
+    for id in "${!TASK_PID[@]}"; do [[ -f $TASKS/$id.result ]] && return 0; done
+    return 1
+}
+reap_tasks() {
+    local id rf m changed=0 g
+    for id in "${!TASK_PID[@]}"; do
+        rf="$TASKS/$id.result"
+        [[ -f $rf ]] || continue
+        m=$(tail -n +2 "$rf"); [[ -n $m ]] && MSG="$m"
+        rm -f "$rf"; wait "${TASK_PID[$id]}" 2>/dev/null
+        g="${T_GROUP[$id]}"
+        unset 'TASK_PID[$id]' 'INFLIGHT[$id]'
+        GROUP_BUSY[$g]=0; GROUP_OWNER[$g]=""
+        BUSY_SINCE[$id]=""; BUSY_NOTE[$id]=""; TASK_FORCED[$id]=""
+        rm -f "$TASKS/$id.note"
+        changed=1
+    done
+    (( changed )) && { refresh_status; write_state; }
+    # A preset that was waiting on the desktop gets its second pass here, once
+    # nothing is in flight. Deliberately after refresh_status, so the replay
+    # sees current availability -- turning the desktop back on makes the wm
+    # toggles reachable again, and they are only then worth applying.
+    if [[ -n $PENDING_PRESET ]] && ! busy_any; then
+        local pending="$PENDING_PRESET"
+        PENDING_PRESET=""
+        apply_preset "$pending"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- commands --
+handle_cmd() {
+    local verb rest id target key val
+    read -r verb rest <<<"$1"
+    case "$verb" in
+        hello)   [[ -d /proc/$rest ]] && refresh_status; write_state ;;
+        bye)     rm -f "$CLIENTS/$rest.fifo" ;;
+        reload)
+            # Re-scan the toggle directory so a file dropped in is picked up
+            # without restarting the daemon.
+            TOGGLE_IDS=()
+            T_FILE=(); T_LABEL=(); T_KEY=(); T_PARENT=()
+            T_GROUP=(); T_COMP=(); T_PREFIX=(); T_CAT=()
+            T_DEFER=(); T_DEFER_ON=(); T_TIMEOUT=(); T_ONTIME=(); T_SECTION=()
+            GROUP_BUSY=(); GROUP_OWNER=()
+            load_toggles; build_cfg_keys; check_key_clashes
+            refresh_status
+            MSG="reloaded ${#TOGGLE_IDS[@]} toggles"
+            write_state ;;
+        preset)  apply_preset "$rest" ;;
+        profile)
+            # Switch the active model profile. Restarting the feature is the
+            # whole point -- the server has to reload different weights -- so
+            # this is deliberately not a silent config write.
+            if ! grep -qE "^llm\\.profile\\.${rest}\\.model=" "$CFG" 2>/dev/null; then
+                MSG="no such profile: $rest"; write_state; return 0
+            fi
+            cfg_set llm.profile "$rest"
+            MSG="profile: $rest"
+            if [[ ${STATUS[llm]:-off} == on && -z ${TASK_PID[llm]:-} ]]; then
+                start_task llm restart
+            fi
+            refresh_status; write_state ;;
+        refresh) refresh_status; write_state ;;
+        done)    : ;;                      # wake only; reap happens at loop top
+        note)
+            # A running toggle reported progress. Only meaningful while it is
+            # still the task we think it is.
+            [[ -n ${TASK_PID[$rest]:-} && -f $TASKS/$rest.note ]] \
+                && { BUSY_NOTE[$rest]=$(<"$TASKS/$rest.note"); write_state; } ;;
+        stop)    exit 0 ;;
+        cfg)
+            read -r key val <<<"$rest"
+            [[ " ${CFG_KEYS[*]} " == *" $key "* ]] || return 0
+            [[ $val == 0 || $val == 1 ]] || return 0
+            cfg_set "$key" "$val"; refresh_status; MSG="$key=$val"; write_state ;;
+        set)
+            read -r id target <<<"$rest"
+            [[ -n ${T_FILE[$id]:-} ]] || return 0
+            if ! available "$id"; then
+                MSG="${T_LABEL[$id]} needs a desktop session"; write_state; return 0
+            fi
+            if [[ -n ${TASK_PID[$id]:-} ]]; then
+                MSG="${T_LABEL[$id]} is already working"; write_state; return 0
+            fi
+            if [[ ${GROUP_BUSY[${T_GROUP[$id]}]:-0} == 1 ]]; then
+                MSG="${T_LABEL[${GROUP_OWNER[${T_GROUP[$id]}]}]} is busy - locked"
+                write_state; return 0
+            fi
+            [[ $target == toggle ]] && { [[ ${STATUS[$id]} == off ]] && target=on || target=off; }
+            [[ $target == on || $target == off ]] || return 0
+            MSG=""; start_task "$id" "$target"; write_state ;;
+    esac
+}
+
+# Only toggles whose current state differs are acted on, so applying a preset
+# never restarts something already in the wanted state.
+# Takes a task down along with anything it spawned. start_task gives each one
+# its own process group precisely so this can be done without leaving a
+# systemctl stop running behind the escalation's back.
+kill_task() {
+    local pid="${TASK_PID[$1]:-}"
+    [[ -n $pid ]] || return 0
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -f "$TASKS/$1.result" "$TASKS/$1.result.tmp"
+    local g="${T_GROUP[$1]}"
+    unset 'TASK_PID[$1]' 'INFLIGHT[$1]'
+    GROUP_BUSY[$g]=0; GROUP_OWNER[$g]=""
+}
+
+# A task that has run past its timeout. force runs the toggle's harder path;
+# rollback puts things back the way they were. Either way the row stops sitting
+# yellow forever and the client gets told why.
+expire_task() {
+    local id="$1" target="${INFLIGHT[$id]}" limit="${T_TIMEOUT[$id]:-30}"
+    local mode="${T_ONTIME[$id]:-rollback}" back
+    kill_task "$id"
+    if [[ $mode == force ]]; then
+        MSG="${T_LABEL[$id]}: no answer after ${limit}s - forcing"
+        start_task "$id" "force-$target"
+    else
+        [[ $target == on ]] && back=off || back=on
+        MSG="${T_LABEL[$id]}: no answer after ${limit}s - rolling back"
+        start_task "$id" "$back"
+    fi
+    # Set after start_task, which clears it: the replacement task gets one
+    # deadline of its own and is then abandoned rather than escalated again.
+    TASK_FORCED[$id]=1
+    write_state
+}
+
+# The escalation itself overran. Nothing left to try, so stop, find out what
+# the world actually looks like, and say so.
+abandon_task() {
+    local id="$1" limit="${T_TIMEOUT[$id]:-30}"
+    kill_task "$id"
+    BUSY_SINCE[$id]=""; BUSY_NOTE[$id]=""; TASK_FORCED[$id]=""
+    MSG="!${T_LABEL[$id]}: gave up after ${limit}s, left ${STATUS[$id]:-unknown}"
+    refresh_status; write_state
+}
+
+check_deadlines() {
+    local id now=$EPOCHSECONDS limit since
+    for id in "${!TASK_PID[@]}"; do
+        since="${BUSY_SINCE[$id]:-0}"
+        limit="${T_TIMEOUT[$id]:-30}"
+        [[ -z $since || $since == 0 ]] && continue
+        (( now - since < limit )) && continue
+        if [[ -n ${TASK_FORCED[$id]:-} ]]; then abandon_task "$id"
+        else expire_task "$id"; fi
+    done
+}
+
+# True while any toggle task is still running.
+busy_any() {
+    local g
+    for g in "${!GROUP_BUSY[@]}"; do
+        [[ ${GROUP_BUSY[$g]} == 1 ]] && return 0
+    done
+    return 1
+}
+apply_preset() {
+    local name="$1" line id target changed=0 blocked=0 deferred=0 unavail=0 env_up=0
+    local -a late=()
+    while IFS= read -r line; do
+        id="${line%%=*}"; id="${id##*.}"
+        target="${line#*=}"
+        [[ -n ${T_FILE[$id]:-} ]] || continue
+        available "$id" || { unavail=$((unavail + 1)); continue; }
+        [[ ${STATUS[$id]} == "$target" ]] && continue
+        [[ ${T_DEFER[$id]} == 1 && $target == on ]] && env_up=1
+        if [[ ${GROUP_BUSY[${T_GROUP[$id]}]:-0} == 1 ]]; then
+            blocked=$((blocked + 1)); continue
+        fi
+        # Two kinds of toggle have to wait for everything else.
+        #
+        # defer_off owns the environment the others live in -- the desktop.
+        # Switching it off has to happen after they have finished quitting, or
+        # Steam and friends are orphaned in app.slice with no session round them.
+        #
+        # defer_on consumes what the others release -- the LLM server wants the
+        # VRAM the desktop is still holding, so it must start after the desktop
+        # has gone, not beside it.
+        #
+        # Collected here and started below, so neither depends on config order.
+        if [[ ${T_DEFER[$id]} == 1 && $target == off ]] \
+           || [[ ${T_DEFER_ON[$id]} == 1 && $target == on ]]; then
+            late+=("$id:$target"); continue
+        fi
+        start_task "$id" "$target"
+        changed=$((changed + 1))
+    done < <(grep -E "^preset\.${name}\.[A-Za-z0-9_-]+=(on|off)$" "$CFG" 2>/dev/null)
+
+    PENDING_PRESET=""
+    # Bringing the desktop up makes the wm toggles reachable, but only after
+    # the task finishes -- so anything skipped as unavailable in this pass is
+    # worth a second look. t_on does not return until graphical-session.target
+    # is active, so by the replay the availability answer has changed.
+    if (( env_up && unavail )); then
+        PENDING_PRESET="$name"; deferred=$((deferred + 1))
+    fi
+    for line in "${late[@]}"; do
+        id="${line%%:*}"; target="${line#*:}"
+        if busy_any; then
+            # Replayed from reap_tasks once the last task lands. apply_preset
+            # skips toggles already at target, so replaying the whole preset
+            # is cheap and idempotent.
+            PENDING_PRESET="$name"; deferred=$((deferred + 1))
+        else
+            start_task "$id" "$target"
+            changed=$((changed + 1))
+        fi
+    done
+    if (( changed == 0 && blocked == 0 && deferred == 0 )); then
+        MSG="$name: already applied"
+    else
+        MSG="$name: applying $changed"
+        (( blocked )) && MSG="$MSG ($blocked blocked)"
+        (( deferred )) && MSG="$MSG (+desktop pass)"
+    fi
+    write_state
+}
+
+shutdown() {
+    [[ -n ${RESUME_PID:-} ]] && kill "$RESUME_PID" 2>/dev/null
+    # Deliberately does not turn anything off. The daemon is not what owns a
+    # toggle's effect -- a hotspot, a systemd unit or a screensaver inhibit
+    # outlives it -- and clients come and go independently, so tying state to
+    # either would make the state depend on who happens to be watching.
+    rm -f "$STATE"
+    notify_clients
+}
+trap 'shutdown; exit 0' TERM INT
+
+# An explicit key is optional now that clients number rows by position, but
+# if two features do claim the same one, say so rather than failing quietly.
+check_key_clashes() {
+    local id seen="" k
+    for id in "${TOGGLE_IDS[@]}"; do
+        k="${T_KEY[$id]}"
+        [[ -z $k ]] && continue
+        if [[ " $seen " == *" $k "* ]]; then
+            MSG="two features both claim key '$k'"
+        fi
+        seen="$seen $k"
+    done
+}
+
+load_toggles
+build_cfg_keys
+check_key_clashes
+refresh_status
+write_state
+
+# on_boot and on_resume name a preset, or are empty to do nothing. Applying a
+# preset only acts on toggles whose state differs, so re-applying it on every
+# resume costs nothing and cannot disturb something already running.
+_boot=$(cfg_text on_boot)
+[[ -n $_boot ]] && apply_preset "$_boot"
+
+# The watcher writes into the same fifo the daemon already reads, so resume
+# needs no second service and no signal handling here.
+RESUME_PID=""
+_resume=$(cfg_text on_resume)
+if [[ -n $_resume && -x "$ROOT/lib/resume-watch.py" ]]; then
+    "$ROOT/lib/resume-watch.py" "$FIFO" "preset $_resume" >/dev/null 2>&1 &
+    RESUME_PID=$!
+fi
+
+exec 9<>"$FIFO"
+# While a task runs, re-read the world every couple of seconds. A long action
+# -- bringing the desktop up takes the better part of a minute -- changes things
+# the daemon is not told about: other features stop being available, the session
+# appears, a unit the feature started comes up. Without this a client shows a
+# frozen picture with one spinning row until the task lands.
+#
+# Bounded on purpose. It only runs while something is in flight, it is off the
+# wakeup the deadline check already needs, and an idle daemon still blocks on
+# the fifo indefinitely rather than waking to look at anything.
+REFRESH_EVERY=2
+LAST_REFRESH=0
+
+while true; do
+    reap_tasks                       # never judge a command against a stale lock
+    line=""
+    if (( ${#TASK_PID[@]} )); then
+        check_deadlines
+        if (( EPOCHSECONDS - LAST_REFRESH >= REFRESH_EVERY )); then
+            LAST_REFRESH=$EPOCHSECONDS
+            refresh_status
+            write_state
+        fi
+        tasks_ready && continue
+        # One second, not sixty, but only while something is actually running:
+        # a deadline has to be noticed promptly and there is no signal for
+        # "this has taken too long". Idle still blocks on the fifo forever.
+        read -r -t 1 line <&9
+    else
+        read -r line <&9
+    fi
+    [[ -n $line ]] && handle_cmd "$line"
+done

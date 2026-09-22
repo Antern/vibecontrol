@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.4
+Name=vibecontrol
+GenericName=Machine Modes
+Comment=Toggle server mode, AirPods mic and SM2 macro
+Exec=konsole --separate --hide-menubar --hide-tabbar -p TerminalColumns=88 -p TerminalRows=26 -e vibecontrol
+Icon=dashboard-show
+Terminal=false
+Categories=Settings;
+Keywords=vibecontrol;vibecontrol;toggle;hotspot;server;macro;airpods;
+StartupNotify=true
+SingleMainWindow=true

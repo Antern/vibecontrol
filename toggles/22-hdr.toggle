@@ -1,0 +1,32 @@
+category="wm"
+label="HDR"
+group="hdr"
+section="desktop"
+# Lives in the graphical session, so it hangs off the feature that owns it.
+parent="desktop"
+
+# HDR and wide colour gamut have to move together. Leaving the gamut enabled
+# with HDR off feeds wide-gamut content to the panel with no tone mapping,
+# which looks harshly oversaturated -- so both are set in one kscreen-doctor
+# invocation rather than two, and the display never passes through that state.
+#
+# kscreen-doctor is KDE's tool, but these are plain output properties rather
+# than compositor internals.
+_out() {
+    kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | awk '/^Output:/{n=$3} /^[[:space:]]+enabled$/{print n; exit}'
+}
+t_status() {
+    local v
+    v=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | awk '/^[[:space:]]+HDR:/{print $2; exit}')
+    [[ $v == enabled ]] && echo on || echo off
+}
+t_on() {
+    local o; o=$(_out); [[ -n $o ]] || return 1
+    kscreen-doctor "output.$o.wcg.enable" "output.$o.hdr.enable" >/dev/null 2>&1
+}
+t_off() {
+    local o; o=$(_out); [[ -n $o ]] || return 1
+    kscreen-doctor "output.$o.hdr.disable" "output.$o.wcg.disable" >/dev/null 2>&1
+}
