@@ -12,10 +12,14 @@ check)
     rpm -q mesa-va-drivers-freeworld >/dev/null 2>&1 \
         || { echo "mesa-va-drivers-freeworld missing (hardware encode unavailable)"; exit 1; } ;;
 root-install)
+    # firewall-cmd needs the daemon; without it the ports are simply not opened
+    # and saying so is more use than a bare failure.
+    firewall-cmd --state >/dev/null 2>&1 || { echo "firewalld is not running; ports not opened"; exit 1; }
     firewall-cmd --permanent --add-port=27031-27036/udp >/dev/null 2>&1
     firewall-cmd --permanent --add-port=27036-27037/tcp >/dev/null 2>&1
     firewall-cmd --reload >/dev/null 2>&1 && echo "opened Remote Play ports" ;;
 root-uninstall)
+    firewall-cmd --state >/dev/null 2>&1 || { echo "firewalld is not running; nothing to close"; exit 0; }
     firewall-cmd --permanent --remove-port=27031-27036/udp >/dev/null 2>&1
     firewall-cmd --permanent --remove-port=27036-27037/tcp >/dev/null 2>&1
     firewall-cmd --reload >/dev/null 2>&1 && echo "closed Remote Play ports" ;;

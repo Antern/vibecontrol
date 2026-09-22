@@ -83,17 +83,28 @@ ExecStart=-/sbin/agetty -o '-p -f -- \\u' --noclear --autologin @USER@ - $TERM
 CONF
 sed -i "s/@USER@/$USER_NAME/" "/etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
 chmod 0644 "/etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
-systemctl daemon-reload
+# Best-effort: the files are written either way, and a reload failing
+# (no systemd as PID 1, a chroot) must not make a successful install
+# report as failed -- the caller records features by exit status.
+systemctl daemon-reload 2>/dev/null || echo "note: daemon-reload failed; reload manually"
 
 # The daemon must outlive the graphical session it is able to switch off.
-loginctl enable-linger "$USER_NAME"
+# Tolerated: on a machine without a running logind (a container, a chroot)
+# this cannot work, and the polkit rule and drop-in written above are
+# still valid. set -e would otherwise abort here and report the whole
+# install as failed after it had already succeeded.
+loginctl enable-linger "$USER_NAME" 2>/dev/null \
+    || echo "note: could not enable linger; run: loginctl enable-linger $USER_NAME"
 
 echo "installed:"
 echo "  /etc/polkit-1/rules.d/50-vibecontrol-desktop.rules"
 echo "      covering $DM_UNIT, user@$GREETER_UID.service and $CONSOLE_UNIT"
 echo "  /etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
-echo "  linger for $USER_NAME: $(loginctl show-user "$USER_NAME" -p Linger --value)"
+echo "  linger for $USER_NAME: $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null || echo unknown)"
 echo
 echo "verify without touching the session:"
 echo "  pkcheck --action-id org.freedesktop.systemd1.manage-units \\"
 echo "      --process \$\$ --detail unit $DM_UNIT --detail verb stop"
+
+# Explicit: the exit status decides whether the caller records this feature.
+exit 0
