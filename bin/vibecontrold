@@ -30,6 +30,11 @@ TASKS="$RUN/tasks"
 MSG=""
 # Set when a preset could not finish in one pass; replayed from reap_tasks.
 PENDING_PRESET=""
+# Toggles whose task failed while a preset was being applied. A preset replays
+# until it converges, so without this a feature that cannot reach its target --
+# the LLM refusing because the GPU is still busy, say -- is started, fails,
+# replays, starts again, forever. One attempt per feature per preset.
+declare -A PRESET_FAILED=()
 # Models found on disk, as TSV from lib/gguf-scan.py. Cached rather than
 # rescanned on every state write: a client asks for a scan when it opens the
 # model menu, which is the only moment the answer can have changed in a way
@@ -392,11 +397,16 @@ tasks_ready() {
     return 1
 }
 reap_tasks() {
-    local id rf m changed=0 g
+    local id rf m rc changed=0 g
     for id in "${!TASK_PID[@]}"; do
         rf="$TASKS/$id.result"
         [[ -f $rf ]] || continue
+        rc=$(head -1 "$rf")
         m=$(tail -n +2 "$rf"); [[ -n $m ]] && MSG="$m"
+        # Remember a failure only while a preset is mid-flight, so the replay
+        # does not start this same task again and loop. Outside a preset the
+        # user is free to retry by hand as often as they like.
+        [[ -n $PENDING_PRESET && ${rc:-0} != 0 ]] && PRESET_FAILED[$id]=1
         rm -f "$rf"; wait "${TASK_PID[$id]}" 2>/dev/null
         g="${T_GROUP[$id]}"
         unset 'TASK_PID[$id]' 'INFLIGHT[$id]'
@@ -413,7 +423,7 @@ reap_tasks() {
     if [[ -n $PENDING_PRESET ]] && ! busy_any; then
         local pending="$PENDING_PRESET"
         PENDING_PRESET=""
-        apply_preset "$pending"
+        apply_preset "$pending" replay
     fi
     return 0
 }
@@ -616,14 +626,24 @@ busy_any() {
     return 1
 }
 apply_preset() {
-    local name="$1" line id target changed=0 blocked=0 deferred=0 unavail=0 env_up=0
-    local -a late=()
+    # $2 is "replay" when reap_tasks is continuing an earlier pass. A fresh
+    # application forgets previous failures; a replay must not, or it retries
+    # what just failed and never terminates.
+    local name="$1" replay="${2:-}" line id target changed=0 blocked=0 deferred=0 unavail=0 env_up=0
+    [[ $replay == replay ]] || PRESET_FAILED=()
+    # Two late sets, and the order between them is the point: whatever releases
+    # a resource must finish before whatever consumes it starts. One shared list
+    # ordered by position in the config file started the LLM while the desktop
+    # still held the GPU, which failed, replayed and looped.
+    local -a late_off=() late_on=()
     while IFS= read -r line; do
         id="${line%%=*}"; id="${id##*.}"
         target="${line#*=}"
         [[ -n ${T_FILE[$id]:-} ]] || continue
         available "$id" || { unavail=$((unavail + 1)); continue; }
         [[ ${STATUS[$id]} == "$target" ]] && continue
+        # Tried once during this preset and failed; retrying is what loops.
+        [[ -n ${PRESET_FAILED[$id]:-} ]] && continue
         [[ ${T_DEFER[$id]} == 1 && $target == on ]] && env_up=1
         if [[ ${GROUP_BUSY[${T_GROUP[$id]}]:-0} == 1 ]]; then
             blocked=$((blocked + 1)); continue
@@ -639,9 +659,11 @@ apply_preset() {
         # has gone, not beside it.
         #
         # Collected here and started below, so neither depends on config order.
-        if [[ ${T_DEFER[$id]} == 1 && $target == off ]] \
-           || [[ ${T_DEFER_ON[$id]} == 1 && $target == on ]]; then
-            late+=("$id:$target"); continue
+        if [[ ${T_DEFER[$id]} == 1 && $target == off ]]; then
+            late_off+=("$id:$target"); continue
+        fi
+        if [[ ${T_DEFER_ON[$id]} == 1 && $target == on ]]; then
+            late_on+=("$id:$target"); continue
         fi
         start_task "$id" "$target"
         changed=$((changed + 1))
@@ -655,6 +677,7 @@ apply_preset() {
     if (( env_up && unavail )); then
         PENDING_PRESET="$name"; deferred=$((deferred + 1))
     fi
+    local -a late=("${late_off[@]}" "${late_on[@]}")
     for line in "${late[@]}"; do
         id="${line%%:*}"; target="${line#*:}"
         if busy_any; then
@@ -667,6 +690,14 @@ apply_preset() {
             changed=$((changed + 1))
         fi
     done
+    local skipped=${#PRESET_FAILED[@]}
+    if (( skipped && changed == 0 && deferred == 0 )); then
+        # Naming them matters: the preset stops short and the reason is in the
+        # failing feature's own message, which has already scrolled past.
+        MSG="!$name: gave up on ${!PRESET_FAILED[*]}"
+        write_state
+        return 0
+    fi
     if (( changed == 0 && blocked == 0 && deferred == 0 )); then
         MSG="$name: already applied"
     else
