@@ -271,9 +271,37 @@ the feature refuses and says what it needs:
     godot: needs 16200 MiB free, 15374 MiB available -- switch to headless or
     pick a smaller profile
 
-Qwen3.8-27B IQ4_XS at 65536 context with `q8_0` KV measured **15.83 GB of a
-15.92 GB card**, so it is a headless-only profile. `godot-desktop` is the same
-model at 24576 context for when Plasma is running.
+### Measuring the context ceiling
+
+Measure what **serves**, not what loads. Weights and KV are allocated at load,
+but hipBLAS takes its workspace on the first decode and prompt-processing
+buffers scale with the batch -- so a probe that stops at `/health` reports a
+context that will die on the first real request. Every rung below had to load,
+answer a short request, answer a ~9k-token one, and still be running after.
+
+Qwen3.8-27B IQ4_XS, `q8_0` KV, `-fa on`, `--parallel 2 --kv-unified`, headless
+on a 16304 MiB card:
+
+    context   peak MiB   spare    result
+     65536      16026      278    serves
+     67584      16104      200    serves
+     69632      16182      122    serves      <- configured
+     71680      16231       73    serves
+     73728      16279       25    serves, but that is not a margin
+     81920        --        --    does not load
+
+The two endpoints give **31.6 KiB of KV per token**, which is far cheaper than
+the geometry suggests (65 layers x 4 KV heads x 512 would be ~141 KiB at q8_0).
+The difference says most layers do not keep a full cache -- consistent with a
+hybrid attention design -- and it is why a 27B model reaches 70k context on a
+16 GB card at all.
+
+hipBLAS workspace turned out to be about 46 MiB, so the margin that matters is
+for fragmentation over a long session rather than for that allocation. 69632 is
+configured with 122 MiB spare; 73728 works today and would be the first thing
+to fail on a bad day.
+
+`godot-desktop` is the same model at 24576 context for when Plasma is running.
 
 ## Config keys
 
