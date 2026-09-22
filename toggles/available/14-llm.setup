@@ -34,8 +34,10 @@ install)
             && echo "generated $local_key"
     fi
     cfg_default llm.keyfile "$local_key"
-    mkdir -p "$(grep -E '^llm\.models_dir=' "$CFG" | tail -1 | cut -d= -f2-)" 2>/dev/null
-    ;;
+    mkdir -p "$(grep -E '^llm\.models_dir=' "$CFG" | tail -1 | cut -d= -f2-)" 2>/dev/null || true
+    # Explicit success: the phase's exit status is what decides whether the
+    # installer records this feature, so it must not be a stray mkdir's.
+    : ;;
 uninstall)
     # Config and key are left: the key may be pasted into clients elsewhere, and
     # models and profiles are user data.

@@ -101,7 +101,12 @@ remove_core() {
     [[ -d $run ]] && { rm -rf "$run"; step "removed $run"; }
     # An empty toggles dir is ours; a non-empty one has something we did not put
     # there, and removing it would take that with it.
-    rmdir "$VC_TOGGLE_DIR" 2>/dev/null && step "removed ~/.config/vibecontrol/toggles"
+    if rmdir "$VC_TOGGLE_DIR" 2>/dev/null; then step "removed ~/.config/vibecontrol/toggles"
+    elif [[ -d $VC_TOGGLE_DIR ]]; then
+        warn "left $VC_TOGGLE_DIR: it holds files vibecontrol did not install"
+    fi
+    # An emptied manifest is litter; a non-empty one means something was left.
+    [[ -f $VC_MANIFEST && ! -s $VC_MANIFEST ]] && { rm -f "$VC_MANIFEST"; step "removed manifest"; }
 }
 
 purge_config() {

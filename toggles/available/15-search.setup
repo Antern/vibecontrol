@@ -29,13 +29,16 @@ install)
         echo "kept existing $SETTINGS"
     fi
     # Quadlets become units at daemon-reload; without this the feature would
-    # report its unit missing until the next login.
-    systemctl --user daemon-reload 2>/dev/null
+    # report its unit missing until the next login. Best-effort: there may be no
+    # session manager (a container, a chroot), and that must not make the whole
+    # phase look failed -- the installer would then refuse to record the feature
+    # and its uninstall would never run.
+    systemctl --user daemon-reload 2>/dev/null || true
     ;;
 uninstall)
     systemctl --user stop searxng.service >/dev/null 2>&1
     rm -f "$QUADLET" && echo "removed $QUADLET"
-    systemctl --user daemon-reload 2>/dev/null
+    systemctl --user daemon-reload 2>/dev/null || true
     echo "settings and pulled images left in place" ;;
 *) echo "usage: $0 {phases|check|install|uninstall}" >&2; exit 2 ;;
 esac
