@@ -13,6 +13,11 @@ timeout=90
 on_timeout=force
 _unit="plasmalogin.service"
 _greeter_user="plasmalogin"
+# plasmalogin declares Conflicts=getty@tty1.service, so the two can never run at
+# once. That is what makes handing this VT back and forth safe in both
+# directions: starting the login manager stops the console by itself, and tty1
+# is the VT already on screen, so no VT switching is involved.
+_console_unit="getty@tty1.service"
 _watch="$ROOT/lib/unit-watch.py"
 
 # Off drops the machine to a text console: the Plasma session and the greeter
@@ -104,6 +109,24 @@ _greeter_settled() {
     return 1
 }
 
+# A login console on the VT the desktop just vacated, so switching to headless
+# leaves something usable on screen instead of a blank tty -- somewhere to run
+# vibecontrol and bring Plasma back without reaching for another machine.
+# Autologin comes from a drop-in that install/desktop-privileges.sh writes; the
+# machine already autologins into Plasma, so this is the same posture.
+# desktop.console=0 turns it off and leaves a bare screen.
+_console_on() {
+    [[ $(cfg_text desktop.console) == 0 ]] && return 0
+    vc_progress "opening a console on tty1"
+    systemctl start "$_console_unit" >/dev/null 2>&1 || true
+}
+
+# Conflicts= means starting the login manager stops this anyway. Doing it first
+# and explicitly keeps the ordering visible rather than implicit in unit
+# metadata, and means a failure to stop shows up here rather than as a confusing
+# login-manager start failure.
+_console_off() { systemctl stop "$_console_unit" >/dev/null 2>&1 || true; }
+
 # Signal-driven, not a sleep loop: unit-watch subscribes to the user manager
 # and returns the moment the target changes state.
 _session_gone() { "$_watch" --timeout "${1:-35}" graphical-session.target inactive; }
@@ -145,6 +168,7 @@ t_on() {
             "$stale" "$stale"
         return 1
     fi
+    _console_off
     _wait_vram
     vc_progress "starting the login manager"
     systemctl start "$_unit" >/dev/null 2>&1 || return 1
@@ -184,6 +208,7 @@ t_off() {
     systemctl stop "$_unit" >/dev/null 2>&1 || return 1
     _stop_greeter
     _session_gone 20 || return 1
+    _console_on
     # Reported rather than failed: the memory this feature exists to free has
     # been freed either way, and the consequence lands on the next start, which
     # refuses with the same session id and the command to clear it.
@@ -208,5 +233,6 @@ t_force() {
     vc_progress "forcing: stopping the login manager"
     systemctl stop "$_unit" >/dev/null 2>&1 || return 1
     _stop_greeter
-    _session_gone 20
+    _session_gone 20 || return 1
+    _console_on
 }

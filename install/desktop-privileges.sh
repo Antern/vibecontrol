@@ -20,6 +20,10 @@ id "$USER_NAME" >/dev/null || exit 1
 DM_UNIT="plasmalogin.service"
 GREETER_USER="plasmalogin"
 GREETER_UID="$(id -u "$GREETER_USER" 2>/dev/null || true)"
+# The VT the login manager occupies. plasmalogin declares
+# Conflicts=getty@tty1.service, so the two can never coexist -- which is
+# exactly what makes handing the VT back and forth safe.
+CONSOLE_UNIT="getty@tty1.service"
 systemctl cat "$DM_UNIT" >/dev/null 2>&1 \
     || { echo "no $DM_UNIT on this machine -- adjust DM_UNIT" >&2; exit 1; }
 
@@ -44,7 +48,9 @@ polkit.addRule(function (action, subject) {
     // in the login manager's control group and survives stopping it. Both have
     // to be stoppable or the greeter's compositor keeps holding the GPU.
     var unit = action.lookup("unit");
-    if (unit !== "$DM_UNIT" && unit !== "user@$GREETER_UID.service") {
+    if (unit !== "$DM_UNIT" &&
+        unit !== "user@$GREETER_UID.service" &&
+        unit !== "$CONSOLE_UNIT") {
         return polkit.Result.NOT_HANDLED;
     }
     var verb = action.lookup("verb");
@@ -59,12 +65,33 @@ chmod 0644 /etc/polkit-1/rules.d/50-vibecontrol-desktop.rules
 # Remove the Relogin drop-in an earlier version of this script installed.
 rm -f /etc/plasmalogin.conf.d/10-vibecontrol-relogin.conf
 
+# Autologin on the console the desktop toggle hands back. Without this, killing
+# the desktop leaves a password prompt on a screen you may be looking at from
+# across the room -- and the machine already autologins into Plasma, so this is
+# the same posture, not a weaker one.
+install -d -m 0755 "/etc/systemd/system/${CONSOLE_UNIT}.d"
+cat > "/etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf" <<'CONF'
+# Installed by vibecontrol (install/desktop-privileges.sh).
+# Inert while the desktop runs: plasmalogin.service conflicts with this unit,
+# so it only ever starts once the desktop has been switched off.
+[Service]
+ExecStart=
+# systemd unescapes C-style sequences in ExecStart, so the file needs \\u for
+# agetty to receive \u. A single backslash here is an invalid escape and the
+# unit refuses to start.
+ExecStart=-/sbin/agetty -o '-p -f -- \\u' --noclear --autologin @USER@ - $TERM
+CONF
+sed -i "s/@USER@/$USER_NAME/" "/etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
+chmod 0644 "/etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
+systemctl daemon-reload
+
 # The daemon must outlive the graphical session it is able to switch off.
 loginctl enable-linger "$USER_NAME"
 
 echo "installed:"
 echo "  /etc/polkit-1/rules.d/50-vibecontrol-desktop.rules"
-echo "      covering $DM_UNIT and user@$GREETER_UID.service"
+echo "      covering $DM_UNIT, user@$GREETER_UID.service and $CONSOLE_UNIT"
+echo "  /etc/systemd/system/${CONSOLE_UNIT}.d/10-vibecontrol-autologin.conf"
 echo "  linger for $USER_NAME: $(loginctl show-user "$USER_NAME" -p Linger --value)"
 echo
 echo "verify without touching the session:"

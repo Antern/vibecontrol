@@ -218,7 +218,7 @@ can be prepared before anything is toggled.
   contradicting `category="common"`. Scope the rule to that one unit and to
   the start/stop/restart verbs only, so whether sshd comes up at boot still
   requires admin authentication.
-- **`50-desktop.toggle`** needs `install/desktop-privileges.sh`, run once as
+- **`80-desktop.toggle`** needs `install/desktop-privileges.sh`, run once as
   root. It installs the equivalent polkit rule for the login manager and
   enables linger for the user. Linger is not optional: without it the user
   manager -- and the daemon with it -- is killed the moment the graphical
@@ -233,6 +233,15 @@ can be prepared before anything is toggled.
   calls) so applications are asked to save and close, and only then is the
   login manager stopped -- a logout alone would leave the greeter running, and
   the greeter is a compositor holding VRAM too.
+
+  The rule covers a third unit, `getty@tty1.service`, and the script installs an
+  autologin drop-in for it. Switching the desktop off would otherwise leave tty1
+  blank, with no way back to Plasma except from another machine; the feature
+  starts a console there instead, so `vibecontrol` is one command away. tty1 is
+  the VT the desktop was already using and `plasmalogin.service` declares
+  `Conflicts=getty@tty1.service`, so the two can never overlap and no VT
+  switching is involved -- starting the login manager stops the console by
+  itself. Set `desktop.console=0` to leave the screen bare instead.
 - **`40-steam.toggle`** — see [`toggles/40-steam.md`](toggles/40-steam.md).
   Remote Play needs rather more than the flag this feature toggles.
 
