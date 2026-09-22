@@ -18,6 +18,7 @@ _greeter_user="plasmalogin"
 # directions: starting the login manager stops the console by itself, and tty1
 # is the VT already on screen, so no VT switching is involved.
 _console_unit="getty@tty1.service"
+_console_tty="tty1"
 _watch="$ROOT/lib/unit-watch.py"
 
 # Off drops the machine to a text console: the Plasma session and the greeter
@@ -117,15 +118,77 @@ _greeter_settled() {
 # desktop.console=0 turns it off and leaves a bare screen.
 _console_on() {
     [[ $(cfg_text desktop.console) == 0 ]] && return 0
+    # Clear anything a previous cycle left behind before adding another, so
+    # repeated off/on never stacks sessions on the VT.
+    _console_off
     vc_progress "opening a console on tty1"
     systemctl start "$_console_unit" >/dev/null 2>&1 || true
 }
 
-# Conflicts= means starting the login manager stops this anyway. Doing it first
-# and explicitly keeps the ordering visible rather than implicit in unit
-# metadata, and means a failure to stop shows up here rather than as a confusing
-# login-manager start failure.
-_console_off() { systemctl stop "$_console_unit" >/dev/null 2>&1 || true; }
+# The logind session sitting on the console VT, if any. It belongs to this
+# user, so its processes can be signalled without privilege.
+#
+# Type=tty is not decoration, it is the safety check. Plasma runs on this same
+# VT and is also this user, so matching on TTY and name alone would select the
+# live desktop session -- and _console_off would then SIGHUP it. A getty
+# session is Type=tty; the Plasma one is Type=wayland.
+_console_session() {
+    local sid
+    while read -r sid; do
+        [[ -n $sid ]] || continue
+        [[ $(loginctl show-session "$sid" -p TTY --value 2>/dev/null) == "$_console_tty" ]] || continue
+        [[ $(loginctl show-session "$sid" -p Type --value 2>/dev/null) == tty ]] || continue
+        [[ $(loginctl show-session "$sid" -p Name --value 2>/dev/null) == "$(id -un)" ]] || continue
+        printf '%s\n' "$sid"
+        return 0
+    done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}')
+    return 1
+}
+
+# Stopping the unit is not enough, for the same reason the greeter needed its
+# own handling: pam_systemd moves the login shell into session-N.scope under
+# user.slice, outside getty@tty1.service's control group. KillMode=control-group
+# therefore reaches agetty and nothing else, and the shell -- with whatever is
+# running in it, a vibecontrol instance included -- outlives the unit still
+# holding tty1 and seat0. That is exactly the stale seat that makes the next
+# desktop start fail and need root to clear.
+_console_kill_session() {
+    local sid="$1" scope procs p i
+    scope=$(loginctl show-session "$sid" -p Scope --value 2>/dev/null)
+    [[ -n $scope ]] || return 0
+    procs="/sys/fs/cgroup/user.slice/user-$(id -u).slice/$scope/cgroup.procs"
+    [[ -r $procs ]] || return 0
+    # SIGHUP is what a terminal going away sends, so a login shell exits on it
+    # and takes its children with it -- a cleaner end than killing outright.
+    while read -r p; do [[ -n $p ]] && kill -HUP "$p" 2>/dev/null; done < "$procs"
+    for i in $(seq 1 10); do
+        [[ -n $(cat "$procs" 2>/dev/null) ]] || return 0
+        sleep 1
+    done
+    while read -r p; do [[ -n $p ]] && kill -KILL "$p" 2>/dev/null; done < "$procs"
+    return 0
+}
+
+# Conflicts= means starting the login manager stops the unit anyway, but that
+# would leave the session behind. Done here and explicitly so the ordering is
+# visible and the VT is genuinely free before Plasma reaches for it.
+_console_off() {
+    local sid i
+    # Unit first: Restart=always means killing the shell while the unit is still
+    # up simply respawns a fresh login on the same VT.
+    systemctl stop "$_console_unit" >/dev/null 2>&1 || true
+    if sid=$(_console_session); then
+        vc_progress "closing the console session on $_console_tty"
+        _console_kill_session "$sid"
+    fi
+    # Wait for logind to release the seat, or starting the login manager races
+    # the teardown and lands on a seat that is still occupied.
+    for i in $(seq 1 10); do
+        _console_session >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    return 0
+}
 
 # Signal-driven, not a sleep loop: unit-watch subscribes to the user manager
 # and returns the moment the target changes state.

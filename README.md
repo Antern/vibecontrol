@@ -242,6 +242,18 @@ can be prepared before anything is toggled.
   `Conflicts=getty@tty1.service`, so the two can never overlap and no VT
   switching is involved -- starting the login manager stops the console by
   itself. Set `desktop.console=0` to leave the screen bare instead.
+
+  Handing the VT back takes more than stopping the unit. `pam_systemd` moves the
+  login shell into `session-N.scope` under `user.slice`, outside
+  `getty@tty1.service`'s control group, so `KillMode=control-group` reaches
+  `agetty` and nothing else: the shell, and any `vibecontrol` running in it,
+  would outlive the unit while still holding tty1 and seat0 -- the stale seat
+  that makes the next desktop start fail. The feature stops the unit first,
+  because `Restart=always` would otherwise respawn a login as soon as the shell
+  died, then ends the session's processes (this user's own, so no privilege is
+  needed) and waits for logind to release the seat. Sessions are matched on
+  `Type=tty`: Plasma occupies the same VT under the same user, and matching on
+  the VT alone would select the live desktop.
 - **`40-steam.toggle`** — see [`toggles/40-steam.md`](toggles/40-steam.md).
   Remote Play needs rather more than the flag this feature toggles.
 
