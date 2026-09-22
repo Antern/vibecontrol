@@ -39,11 +39,18 @@ rm -f "$TASKS"/*.result "$TASKS"/*.tmp 2>/dev/null
 # Derived from the loaded features rather than hardcoded, so adding or
 # removing a feature file cannot leave a stale key behind.
 CFG_KEYS=()
+# A <parent>_<child> key says whether a composite starts that child. Only a
+# composite consults them, and a feature can have children merely for grouping
+# -- web search under the LLM, the desktop features under the desktop -- so
+# generating keys for those produced settings that appeared in the config screen
+# and did nothing.
 build_cfg_keys() {
     local id
     CFG_KEYS=()
     for id in "${TOGGLE_IDS[@]}"; do
-        [[ -n ${T_PARENT[$id]} ]] && CFG_KEYS+=("${T_PARENT[$id]}_$id")
+        [[ -n ${T_PARENT[$id]} ]] || continue
+        [[ ${T_COMP[${T_PARENT[$id]}]:-0} == 1 ]] || continue
+        CFG_KEYS+=("${T_PARENT[$id]}_$id")
     done
 }
 cfg_default() {
