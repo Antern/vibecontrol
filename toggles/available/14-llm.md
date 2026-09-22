@@ -204,6 +204,77 @@ names the same file, that profile is activated too and supplies its `ctx` and
 `alias`; otherwise the plain `llm.*` defaults apply. Profiles are therefore
 optional per-model overrides rather than the source of the list.
 
+## Tuning
+
+Everything below is a config key, per profile or as an `llm.*` default. Unset
+means llama-server's own default is used -- which is worth knowing, because
+those defaults (`temp 0.8`, `top-k 40`, `min-p 0.05`) are not what Qwen
+recommends, so a model that specifies values needs them set explicitly.
+
+Qwen's published sampling for **precise coding** differs from its general-chat
+set; this is the coding one:
+
+    temp=0.6  top_p=0.95  top_k=20  min_p=0.0  presence_penalty=0.0
+
+### Reasoning is a dial, not a switch
+
+Qwen3.8's template takes `reasoning_effort` of `low`, `medium` or `xhigh`, and
+**defaults to xhigh** -- deliberating at length before every reply. Left alone
+in an agent loop that is the difference between a usable assistant and one that
+spends its whole reply budget thinking, and a client reading only `content`
+sees an empty message while it does.
+
+    llm.<profile>.think=1
+    llm.<profile>.reasoning_effort=low
+    llm.<profile>.reasoning_budget=1024     # hard ceiling, in tokens
+    llm.<profile>.reasoning_preserve=0      # keep old turns' thinking out of context
+
+`reasoning_budget` is the safety net: it guarantees the model stops thinking and
+produces content. `reasoning_preserve=0` matters most in the long sessions where
+the model is being useful, because preserved reasoning is resent every turn.
+
+### Concurrency without halving the context
+
+`--parallel N` alone divides the context between slots -- two slots on a 64k
+context leave each client 32k. `kv_unified` puts every sequence in one shared
+pool instead:
+
+    llm.<profile>.parallel=2
+    llm.<profile>.kv_unified=1
+
+    srv load_model: n_slots = 2, n_ctx_slot = 65536, kv_unified = 'true'
+
+Both slots get the full context. This is what makes a harness running sub-agents
+affordable rather than a halving of what each one can see.
+
+### Prompt cache
+
+    llm.<profile>.cache_ram=16384     # MiB of host RAM
+
+An agent loop resends a growing conversation every turn; caching evicted
+prefixes turns a full reprocess into a hit. Host RAM, not VRAM.
+
+### The VRAM guard
+
+    llm.<profile>.vram_mb=16200       # measured, not estimated
+
+Weights and KV cache are both allocated at load, so the requirement is known
+before anything starts -- but it is not derivable from the file size, because
+KV depends on context and the model's layer geometry. Measure it once and
+record it; unset means no check.
+
+This exists because a profile sized for headless mode will load with the
+desktop still up and leave the card with a hundred megabytes spare, at which
+point the next thing wanting GPU memory has nowhere to get it. With the guard
+the feature refuses and says what it needs:
+
+    godot: needs 16200 MiB free, 15374 MiB available -- switch to headless or
+    pick a smaller profile
+
+Qwen3.8-27B IQ4_XS at 65536 context with `q8_0` KV measured **15.83 GB of a
+15.92 GB card**, so it is a headless-only profile. `godot-desktop` is the same
+model at 24576 context for when Plasma is running.
+
 ## Config keys
 
 All in `~/.config/vibecontrol/config`, read at toggle time, nothing hardcoded:

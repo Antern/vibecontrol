@@ -73,8 +73,36 @@ _think()   { local v; v=$(_p think); echo "${v:-0}"; }
 _alias()   { local v; v=$(_p alias); echo "${v:-local}"; }
 _mcpcfg()  { _p mcp_config; }
 _cors()    { _p cors_origins; }
+_parallel() { local v; v=$(_p parallel); echo "${v:-1}"; }
 
 t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
+
+# Free VRAM in MiB, or nothing when there is no discrete card to ask.
+_vram_free_mb() {
+    local card=/sys/class/drm/card1/device
+    [[ -r $card/mem_info_vram_total && -r $card/mem_info_vram_used ]] || return 1
+    echo $(( ( $(cat "$card/mem_info_vram_total") - $(cat "$card/mem_info_vram_used") ) / 1048576 ))
+}
+
+# Refuse a profile that cannot fit rather than letting the driver decide.
+#
+# Weights and KV cache are both allocated up front, so the requirement is known
+# before anything loads -- but it is not derivable from the file size, because
+# the KV cache depends on context and the model's layer geometry. So it is a
+# measured number per profile (vram_mb), and unset means no check.
+#
+# The failure this prevents is specific: a profile sized for headless mode
+# started while the desktop still holds its gigabyte leaves the card with a
+# hundred megabytes spare, and the next thing that wants GPU memory -- a browser
+# tab, the compositor resizing something -- has nowhere to get it.
+_vram_check() {
+    local need free
+    need=$(_p vram_mb); [[ -n $need ]] || return 0
+    free=$(_vram_free_mb) || return 0
+    (( free >= need )) && return 0
+    printf 'needs %s MiB free, %s MiB available' "$need" "$free"
+    return 1
+}
 
 t_on() {
     local m host port ctx key i _mcp _co
@@ -83,6 +111,13 @@ t_on() {
     # rather than as a failure -- there is nothing to retry.
     [[ -n $m && -f $m ]] || return 2
     command -v llama-server >/dev/null 2>&1 || return 2
+
+    local short
+    if ! short=$(_vram_check); then
+        printf '%s: %s -- switch to headless or pick a smaller profile' "$(_profile)" "$short"
+        return 1
+    fi
+
     host=$(_host); port=$(_port); ctx=$(_ctx); key=$(_keyfile)
 
     local -a args=(
@@ -100,14 +135,52 @@ t_on() {
         # Without an alias the model id is the full path on disk, which is what
         # a client has to type as the model name.
         --alias "$(_alias)"
-        # One slot: --parallel N divides the context between slots, so asking
-        # for 16k with two slots gives each client only 8k.
-        --parallel 1
+        --parallel "$(_parallel)"
     )
+    # --parallel alone divides the context between slots, so two slots on a 64k
+    # context leave each client 32k. --kv-unified puts every sequence in one
+    # shared buffer instead, which is what makes concurrent requests -- an agent
+    # running sub-agents, say -- affordable rather than a halving of context.
+    [[ $(_parallel) -gt 1 && $(_p kv_unified) != 0 ]] && args+=(--kv-unified)
+
+    # Sampling. Only passed when configured, so anything left unset keeps
+    # llama-server's own default rather than one invented here -- but note those
+    # defaults (temp 0.8, top-k 40, min-p 0.05) are not what Qwen recommends, so
+    # for a model that specifies values it is worth setting them.
+    local v
+    v=$(_p temp);             [[ -n $v ]] && args+=(--temp "$v")
+    v=$(_p top_p);            [[ -n $v ]] && args+=(--top-p "$v")
+    v=$(_p top_k);            [[ -n $v ]] && args+=(--top-k "$v")
+    v=$(_p min_p);            [[ -n $v ]] && args+=(--min-p "$v")
+    v=$(_p presence_penalty); [[ -n $v ]] && args+=(--presence-penalty "$v")
+    v=$(_p n_predict);        [[ -n $v ]] && args+=(--n-predict "$v")
+    # Host-side cache of evicted prompts. An agent loop resends a growing
+    # conversation every turn, so keeping old prefixes around turns a full
+    # reprocess into a cache hit.
+    v=$(_p cache_ram);        [[ -n $v ]] && args+=(--cache-ram "$v")
+    # A hard ceiling on thinking tokens, independent of how hard the model wants
+    # to think. Without it a reasoning model can spend an entire reply budget
+    # deliberating and return nothing.
+    v=$(_p reasoning_budget); [[ -n $v ]] && args+=(--reasoning-budget "$v")
     [[ -n $key && -f $key ]] && args+=(--api-key-file "$key")
-    # Only passed when disabling: a template without the variable ignores it,
-    # but there is no reason to send it when thinking is wanted.
-    [[ $(_think) == 1 ]] || args+=(--chat-template-kwargs '{"enable_thinking":false}')
+
+    # Chat-template knobs, assembled together because they share one flag.
+    #
+    # Qwen3.8 does not offer thinking as on/off: its template takes a
+    # reasoning_effort of low, medium or xhigh, and defaults to xhigh -- which
+    # deliberates at length before every answer. For an agent loop that is the
+    # difference between a usable assistant and one that spends its reply budget
+    # thinking. preserve_thinking=false keeps earlier turns' reasoning out of the
+    # context that gets resent, which matters most in exactly the long sessions
+    # where the model is being useful.
+    local -a ctk=()
+    if [[ $(_think) == 1 ]]; then
+        v=$(_p reasoning_effort); [[ -n $v ]] && ctk+=("\"reasoning_effort\":\"$v\"")
+        [[ $(_p reasoning_preserve) == 1 ]] || ctk+=('"preserve_thinking":false')
+    else
+        ctk+=('"enable_thinking":false')
+    fi
+    (( ${#ctk[@]} )) && args+=(--chat-template-kwargs "{$(IFS=,; printf '%s' "${ctk[*]}")}")
     _mcp=$(_mcpcfg)
     if [[ -n $_mcp && -f $_mcp ]]; then
         args+=(--mcp-servers-config "$_mcp")

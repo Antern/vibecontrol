@@ -310,8 +310,9 @@ run_target() {
         # its desired state -- a different model, say. Failing the off half is
         # not fatal: the point is to end up on.
         toggle_call "$id" off >/dev/null 2>&1
-        toggle_call "$id" on; rc=$?
-        (( rc != 0 )) && { printf 'Could not restart %s' "${T_LABEL[$id]}"; return 1; }
+        local out
+        out=$(toggle_call "$id" on); rc=$?
+        (( rc != 0 )) && { printf '%s' "${out:-Could not restart ${T_LABEL[$id]}}"; return 1; }
         printf '%s restarted' "${T_LABEL[$id]}"
         return 0
     elif [[ $target == force-* ]]; then
@@ -326,9 +327,13 @@ run_target() {
         printf '%s %s (forced)' "${T_LABEL[$id]}" "${want^^}"
         return 0
     else
-        toggle_call "$id" "$target"; rc=$?
-        (( rc == 2 )) && { printf '%s unavailable' "${T_LABEL[$id]}"; return 1; }
-        (( rc != 0 )) && { printf 'Could not turn %s %s' "${T_LABEL[$id]}" "$target"; return 1; }
+        # Captured rather than let through: a feature that explains why it
+        # refused says something more useful than "could not turn X on", and
+        # letting both reach the client concatenates them into one run-on line.
+        local out
+        out=$(toggle_call "$id" "$target"); rc=$?
+        (( rc == 2 )) && { printf '%s' "${out:-${T_LABEL[$id]} unavailable}"; return 1; }
+        (( rc != 0 )) && { printf '%s' "${out:-Could not turn ${T_LABEL[$id]} $target}"; return 1; }
     fi
     printf '%s %s' "${T_LABEL[$id]}" "${target^^}"
 }
