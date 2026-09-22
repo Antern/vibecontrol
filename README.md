@@ -259,14 +259,54 @@ can be prepared before anything is toggled.
 
 ## Install
 
-    mkdir -p ~/.local/bin ~/.config/vibecontrol ~/.config/systemd/user \
-             ~/.local/share/applications
-    ln -s "$PWD/bin/vibecontrol"  ~/.local/bin/vibecontrol
-    ln -s "$PWD/bin/vibecontrold" ~/.local/bin/vibecontrold
-    ln -s "$PWD/toggles"         ~/.config/vibecontrol/toggles
-    ln -s "$PWD/systemd/vibecontrol-daemon.service" ~/.config/systemd/user/
-    ln -s "$PWD/desktop/vibecontrol.desktop" ~/.local/share/applications/
-    systemctl --user daemon-reload
-    systemctl --user enable --now vibecontrol-daemon
+    ./install.sh              pick features, install them
+    ./install.sh --all        every feature
+    ./install.sh --list       show what is available, change nothing
+    sudo ./install.sh --root  the privileged steps it prints at the end
 
-Run `vibecontrol` in a terminal, or launch it from the desktop entry.
+Re-running is safe and is also the upgrade path: already-linked files are left
+alone and only newly chosen features are added.
+
+Nothing in the installer calls `sudo` on your behalf. Features needing root --
+polkit rules, a getty drop-in, firewall ports -- declare a `root-install` phase,
+and the installer finishes by printing one command that runs exactly those. One
+prompt, and you can read what it will do first.
+
+Features live in `toggles/available/` and are installed by symlinking the ones
+you chose into `~/.config/vibecontrol/toggles`, which is what the daemon reads.
+A feature whose backend is missing is listed but not selected by default:
+installing it would only add a permanently unavailable row to the menu.
+
+`~/.config/vibecontrol/installed` records what was installed, so uninstall knows
+what to undo rather than guessing.
+
+### Feature setup scripts
+
+A feature needing anything beyond its `.toggle` file gets a sibling `.setup`
+script, which dispatches on its first argument and lists what it implements:
+
+    phases          prints the phases below that this script supports
+    check           are the prerequisites present? reports, never modifies
+    install         user-level setup (config defaults, user units, containers)
+    uninstall       undo the above
+    root-install    privileged setup
+    root-uninstall  undo that
+
+Features needing nothing have no script, and the installer just links them.
+
+## Uninstall
+
+    ./uninstall.sh                  remove vibecontrol, keep config and models
+    ./uninstall.sh --toggles=a,b    remove just these features
+    ./uninstall.sh --purge          delete ~/.config/vibecontrol too
+    sudo ./uninstall.sh --root      remove polkit rules, drop-ins and helpers
+
+Model files are never touched, and config survives unless `--purge` is given:
+presets, profiles and keys are work you did. Transient units the features create
+are stopped **and** `reset-failed`, because a failed transient unit lingers in
+systemd's state after its files are gone. Linger is left enabled, since other
+user services may depend on it.
+
+Uninstall works on an install that predates the installer: with no manifest it
+falls back to every feature currently linked. It only ever deletes symlinks that
+point into this repository -- anything else is reported and left alone.

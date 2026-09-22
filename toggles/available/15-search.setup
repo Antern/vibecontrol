@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# search feature: SearXNG in a rootless podman container, as a quadlet so it is
+# an ordinary user unit -- startable and inspectable with systemctl like
+# everything else here, and kept alive by the same linger.
+set -uo pipefail
+ROOT="${VC_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+QUADLET_DIR="$HOME/.config/containers/systemd"
+QUADLET="$QUADLET_DIR/searxng.container"
+SETTINGS_DIR="$HOME/.config/searxng"
+SETTINGS="$SETTINGS_DIR/settings.yml"
+
+case "${1:-}" in
+phases) printf 'check\ninstall\nuninstall\n' ;;
+check)
+    command -v podman >/dev/null 2>&1 || { echo "podman not installed"; exit 1; }
+    [[ -f $QUADLET ]] || { echo "quadlet not installed"; exit 1; } ;;
+install)
+    mkdir -p "$QUADLET_DIR" "$SETTINGS_DIR"
+    install -m 0644 "$ROOT/containers/searxng.container" "$QUADLET"
+    echo "installed $QUADLET"
+    if [[ ! -f $SETTINGS ]]; then
+        # secret_key is generated here rather than shipped: a committed one
+        # would be identical on every install, which is no secret at all.
+        secret=$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        ( umask 077
+          sed "s/@SECRET@/$secret/" "$ROOT/containers/searxng-settings.yml.template" >"$SETTINGS" )
+        echo "generated $SETTINGS"
+    else
+        echo "kept existing $SETTINGS"
+    fi
+    # Quadlets become units at daemon-reload; without this the feature would
+    # report its unit missing until the next login.
+    systemctl --user daemon-reload 2>/dev/null
+    ;;
+uninstall)
+    systemctl --user stop searxng.service >/dev/null 2>&1
+    rm -f "$QUADLET" && echo "removed $QUADLET"
+    systemctl --user daemon-reload 2>/dev/null
+    echo "settings and pulled images left in place" ;;
+*) echo "usage: $0 {phases|check|install|uninstall}" >&2; exit 2 ;;
+esac

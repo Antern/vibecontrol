@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# hotspot feature: brings up a NetworkManager AP profile named "Hotspot".
+#
+# The profile is not created here. It carries an SSID and a passphrase, and
+# those are yours to choose -- check reports what is missing and names the
+# command rather than inventing credentials.
+set -uo pipefail
+case "${1:-}" in
+phases) printf 'check\n' ;;
+check)
+    command -v nmcli >/dev/null 2>&1 || { echo "NetworkManager not installed"; exit 1; }
+    nmcli -g NAME con show 2>/dev/null | grep -qx Hotspot || {
+        echo "no 'Hotspot' connection (see README: nmcli con add ...)"; exit 1; } ;;
+*) echo "usage: $0 {phases|check}" >&2; exit 2 ;;
+esac

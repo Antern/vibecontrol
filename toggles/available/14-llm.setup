@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# llm feature: llama-server on the GPU behind an OpenAI-compatible API.
+#
+# Nothing is downloaded here. Models are large and the choice is yours; the
+# feature discovers whatever is under llm.models_dir, so installing it just
+# means pointing it at a directory.
+set -uo pipefail
+CFG="${VC_CFG_DIR:-$HOME/.config/vibecontrol}/config"
+
+cfg_default() {  # key value -- write only if absent, never overwrite tuning
+    grep -qE "^$1=" "$CFG" 2>/dev/null && return 0
+    mkdir -p "$(dirname "$CFG")"; printf '%s=%s\n' "$1" "$2" >>"$CFG"
+    echo "config: $1=$2"
+}
+
+case "${1:-}" in
+phases) printf 'check\ninstall\nuninstall\n' ;;
+check)
+    command -v llama-server >/dev/null 2>&1 || { echo "llama-server not installed"; exit 1; }
+    # An architecture the build cannot load is the most common way this fails,
+    # and it is invisible until a model refuses to start. See 14-llm.md.
+    ;;
+install)
+    cfg_default llm.models_dir "$HOME/models"
+    cfg_default llm.host 127.0.0.1
+    cfg_default llm.port 8080
+    cfg_default llm.ctx 8192
+    cfg_default llm.think 0
+    local_key="${VC_CFG_DIR:-$HOME/.config/vibecontrol}/llm.key"
+    if [[ ! -f $local_key ]]; then
+        # Generated rather than asked for: it is a machine credential, and the
+        # server is reachable from every device on the hotspot without it.
+        ( umask 077; openssl rand -hex 32 >"$local_key" ) 2>/dev/null \
+            && echo "generated $local_key"
+    fi
+    cfg_default llm.keyfile "$local_key"
+    mkdir -p "$(grep -E '^llm\.models_dir=' "$CFG" | tail -1 | cut -d= -f2-)" 2>/dev/null
+    ;;
+uninstall)
+    # Config and key are left: the key may be pasted into clients elsewhere, and
+    # models and profiles are user data.
+    echo "config, key and models left in place" ;;
+*) echo "usage: $0 {phases|check|install|uninstall}" >&2; exit 2 ;;
+esac

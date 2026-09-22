@@ -1,0 +1,20 @@
+# Minimal SearXNG for local agent use. The only real deviations from the
+# defaults are enabling the json format -- off by default, and the whole point
+# here, since the client is a program rather than a person -- and binding to
+# loopback so this is reachable only from this machine.
+use_default_settings: true
+server:
+  secret_key: "@SECRET@"
+  # Binds inside the container, so this must be the container's own interface;
+  # 127.0.0.1 here would make it unreachable even from the host. Isolation comes
+  # from podman publishing the port to 127.0.0.1 on the host instead.
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false           # no bot-detection: the only client is our own MCP server
+  public_instance: false
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json

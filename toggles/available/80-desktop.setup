@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# desktop feature: switching Plasma off to free the GPU, and back on again.
+#
+# Three privileged pieces, all installed by install/desktop-privileges.sh:
+# a polkit rule covering the login manager, the greeter's own user manager and
+# the console getty; an autologin drop-in for that getty; and linger, without
+# which the user manager -- and the daemon with it -- dies with the session this
+# feature switches off.
+set -uo pipefail
+RULE=/etc/polkit-1/rules.d/50-vibecontrol-desktop.rules
+DROPIN=/etc/systemd/system/getty@tty1.service.d/10-vibecontrol-autologin.conf
+ROOT="${VC_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+
+case "${1:-}" in
+phases) printf 'check\nroot-install\nroot-uninstall\n' ;;
+check)
+    systemctl cat plasmalogin.service >/dev/null 2>&1 || { echo "plasmalogin not installed"; exit 1; }
+    [[ -e $RULE ]] || { echo "polkit rule not installed"; exit 1; }
+    loginctl show-user "${VC_TARGET_USER:-$USER}" -p Linger --value 2>/dev/null \
+        | grep -qx yes || { echo "linger is off"; exit 1; } ;;
+root-install)
+    "$ROOT/install/desktop-privileges.sh" "${VC_TARGET_USER:-${SUDO_USER:-}}" ;;
+root-uninstall)
+    rm -f "$RULE" && echo "removed $RULE"
+    rm -f "$DROPIN" && echo "removed $DROPIN"
+    rmdir /etc/systemd/system/getty@tty1.service.d 2>/dev/null
+    systemctl daemon-reload
+    # Linger is left on deliberately: other user services may rely on it, and
+    # turning it off would kill them at logout without warning.
+    echo "linger left enabled (remove with: loginctl disable-linger <user>)" ;;
+*) echo "usage: $0 {phases|check|root-install|root-uninstall}" >&2; exit 2 ;;
+esac

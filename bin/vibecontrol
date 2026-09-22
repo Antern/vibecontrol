@@ -279,21 +279,34 @@ class UI:
             cells.append(line)
         return header, cells
 
-    def llm_profiles(self):
-        """(name, fields) pairs, active first is NOT enforced -- stable order
-        matters more than ordering by state when the cursor lives here."""
-        llm = (self.doc or {}).get("llm") or {}
-        return sorted((llm.get("profiles") or {}).items())
+    def llm(self):
+        return (self.doc or {}).get("llm") or {}
 
-    def llm_active(self):
-        return ((self.doc or {}).get("llm") or {}).get("profile")
+    def llm_models(self):
+        """Models the daemon found on disk, in its order.
 
-    def pick_profile(self, name):
-        if name == self.llm_active():
-            self.msg = C["dim"] + "%s is already loaded" % name + C["reset"]
+        Discovered rather than configured, so a model downloaded five minutes
+        ago is here without anyone editing a file -- and one that was deleted
+        is not, instead of being a row that fails when picked.
+        """
+        return self.llm().get("models") or []
+
+    def llm_selected(self):
+        """Path that will load next."""
+        return self.llm().get("selected")
+
+    def llm_loaded(self):
+        """Path the running server actually has. Not the same question as
+        selected: changing the model without restarting leaves them apart, and
+        showing only one of them is how a menu lies."""
+        return self.llm().get("loaded")
+
+    def pick_model(self, path):
+        if path == self.llm_loaded():
+            self.msg = C["dim"] + "already loaded" + C["reset"]
             return
-        send("profile %s" % name)
-        self.msg = C["yellow"] + "loading %s" % name + C["reset"]
+        send("model %s" % path)
+        self.msg = C["yellow"] + "loading %s" % os.path.basename(path) + C["reset"]
         self.screen = "main"
 
     def anything_busy(self):
@@ -384,19 +397,31 @@ class UI:
     def build(self):
         rows = []
         if self.screen == "model":
-            active = self.llm_active()
-            for name, p in self.llm_profiles():
-                model = os.path.basename(p.get("model", ""))
+            selected, loaded = self.llm_selected(), self.llm_loaded()
+            for m in self.llm_models():
+                path = m["path"]
+                base = os.path.basename(path).replace(".gguf", "")
                 # The quant is the informative part of these filenames and the
-                # only bit that fits; the rest is the model name, already the
-                # row label.
-                quant = model.replace(".gguf", "").split("-")[-1] if model else "?"
-                detail = "%-9s ctx %-7s" % (quant[:9], p.get("ctx", "?"))
-                mark = (C["green"] + " * loaded" + C["reset"]) if name == active else ""
-                rows.append(Row("%-13s %s%s%s%s" % (name, C["dim"], detail, C["reset"], mark),
-                                action=(lambda n=name: self.pick_profile(n))))
+                # only part worth the width; the rest repeats the model name.
+                quant = base.split("-")[-1][:9]
+                size = "%.1fG" % (m.get("size", 0) / float(1 << 30))
+                # Architecture, because it is what decides whether this build can
+                # load the file at all. A model whose arch the installed
+                # llama.cpp does not implement fails at start with nothing in the
+                # menu having hinted at it.
+                arch = (m.get("arch") or "?")[:10]
+                if path == loaded:
+                    mark = C["green"] + " * loaded" + C["reset"]
+                elif path == selected:
+                    mark = C["yellow"] + " > selected" + C["reset"]
+                else:
+                    mark = ""
+                rows.append(Row(
+                    "%-34s %s%-6s %-9s %-10s%s%s"
+                    % (base[:34], C["dim"], size, quant, arch, C["reset"], mark),
+                    action=(lambda p=path: self.pick_model(p))))
             if not rows:
-                rows.append(Row("no profiles in the config file", heading=True))
+                rows.append(Row("no .gguf files under llm.models_dir", heading=True))
         elif self.screen == "config":
             cfg = self.doc.get("config", {}) if self.doc else {}
             # Composite parents only. A feature can have children merely for
@@ -532,7 +557,7 @@ class UI:
             keys = []
             if self.doc and self.doc.get("config"):
                 keys.append("%sc%s  config" % (C["cyan"], C["reset"]))
-            if self.llm_profiles():
+            if self.llm_models():
                 keys.append("%sm%s  model" % (C["cyan"], C["reset"]))
             keys.append("%sr%s  restart daemon" % (C["cyan"], C["reset"]))
             keys.append("%sd%s  daemon" % (C["cyan"], C["reset"]))
@@ -648,8 +673,11 @@ class UI:
             self.cursor_placed = False
             return True
         if ch == "m" and self.screen == "main":
-            if not self.llm_profiles():
-                self.msg = C["dim"] + "no model profiles configured" + C["reset"]
+            # Rescan on the way in: the list is only allowed to be stale while
+            # nobody is looking at it.
+            send("scan")
+            if not self.llm_models():
+                self.msg = C["dim"] + "no models under llm.models_dir" + C["reset"]
             else:
                 self.screen = "model"
                 self.cursor = 0

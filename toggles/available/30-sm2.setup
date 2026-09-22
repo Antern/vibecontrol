@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# sm2 feature: needs a root helper at /usr/local/libexec/sm2-macro-root-helper.
+#
+# The helper is not shipped with vibecontrol -- it is machine-specific and runs
+# as root, so it is not something an installer should conjure. check reports
+# whether it is present.
+set -uo pipefail
+HELPER=/usr/local/libexec/sm2-macro-root-helper
+case "${1:-}" in
+phases) printf 'check\n' ;;
+check) [[ -x $HELPER ]] || { echo "$HELPER missing"; exit 1; } ;;
+*) echo "usage: $0 {phases|check}" >&2; exit 2 ;;
+esac

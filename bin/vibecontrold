@@ -30,6 +30,11 @@ TASKS="$RUN/tasks"
 MSG=""
 # Set when a preset could not finish in one pass; replayed from reap_tasks.
 PENDING_PRESET=""
+# Models found on disk, as TSV from lib/gguf-scan.py. Cached rather than
+# rescanned on every state write: a client asks for a scan when it opens the
+# model menu, which is the only moment the answer can have changed in a way
+# anyone is looking at.
+MODELS_TSV=""
 
 mkdir -p "$RUN" "$CLIENTS" "$TASKS" 2>/dev/null
 rm -f "$TASKS"/*.result "$TASKS"/*.tmp 2>/dev/null
@@ -66,8 +71,22 @@ cfg_get() {
 cfg_text() { grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2-; }
 cfg_set() {
     mkdir -p "$CFG_DIR" 2>/dev/null; touch "$CFG" 2>/dev/null
-    if grep -qE "^$1=" "$CFG" 2>/dev/null; then sed -i "s/^$1=.*/$1=$2/" "$CFG"
-    else printf '%s=%s\n' "$1" "$2" >>"$CFG"; fi
+    # Rewritten rather than sed-substituted. Values are arbitrary text and model
+    # paths contain slashes, which s/// treats as its own delimiter: the write
+    # then fails silently and the config keeps its old value while everything
+    # reports success. Duplicates of the key are collapsed on the way through.
+    local k="$1" v="$2" line found=0 tmp="$CFG.tmp"
+    : >"$tmp" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line == "$k="* ]]; then
+            (( found )) && continue
+            printf '%s=%s\n' "$k" "$v" >>"$tmp"; found=1
+        else
+            printf '%s\n' "$line" >>"$tmp"
+        fi
+    done <"$CFG"
+    (( found )) || printf '%s=%s\n' "$k" "$v" >>"$tmp"
+    mv -f "$tmp" "$CFG"
 }
 
 # ----------------------------------------------------------------- session --
@@ -184,7 +203,7 @@ refresh_status() {
 
 # ------------------------------------------------------------------- state --
 write_state() {
-    local i=0 id g k b
+    local i=0 id g k b _mi _mp _ms _ma _mn
     {
         echo "daemon_pid=$$"
         echo "msg=$MSG"
@@ -225,6 +244,19 @@ write_state() {
         # anything about models -- the daemon does not interpret them either,
         # beyond which one is active.
         echo "llm_profile=$(cfg_text llm.profile)"
+        echo "llm_model=$(selected_model)"
+        echo "llm_loaded=$(loaded_model)"
+        # Discovered models, one block each. The client renders these; the
+        # daemon does not interpret them beyond which is selected and loaded.
+        _mi=0
+        while IFS=$'\t' read -r _mp _ms _ma _mn; do
+            [[ -n $_mp ]] || continue
+            _mi=$((_mi + 1))
+            echo "m.$_mi.path=$_mp"
+            echo "m.$_mi.size=$_ms"
+            echo "m.$_mi.arch=$_ma"
+            echo "m.$_mi.name=$_mn"
+        done <<<"$MODELS_TSV"
         while IFS= read -r line; do
             [[ -n $line ]] && echo "lp.$line"
         done < <(grep -oE '^llm\.profile\.[A-Za-z0-9_-]+\.(model|ctx|alias)=.*' "$CFG" 2>/dev/null \
@@ -383,7 +415,7 @@ reap_tasks() {
 
 # ---------------------------------------------------------------- commands --
 handle_cmd() {
-    local verb rest id target key val
+    local verb rest id target key val _pname _l
     read -r verb rest <<<"$1"
     case "$verb" in
         hello)   [[ -d /proc/$rest ]] && refresh_status; write_state ;;
@@ -401,6 +433,32 @@ handle_cmd() {
             MSG="reloaded ${#TOGGLE_IDS[@]} toggles"
             write_state ;;
         preset)  apply_preset "$rest" ;;
+        scan)
+            # Sent when a client opens the model menu, so the list reflects what
+            # is on disk now rather than at daemon start.
+            scan_models; write_state ;;
+        model)
+            # Select a model by path. A profile block naming the same file, if
+            # one exists, supplies its ctx and alias; without one the plain
+            # llm.* defaults apply, which the feature already falls back to.
+            if [[ ! -f $rest ]]; then
+                MSG="!no such model: $rest"; write_state; return 0
+            fi
+            cfg_set llm.model "$rest"
+            _pname=$(grep -E "^llm\\.profile\\.[A-Za-z0-9_-]+\\.model=" "$CFG" 2>/dev/null \
+                     | while IFS= read -r _l; do
+                           [[ ${_l#*=} == "$rest" ]] || continue
+                           _l=${_l%%.model=*}; printf '%s' "${_l#llm.profile.}"; break
+                       done)
+            if [[ -n $_pname ]]; then cfg_set llm.profile "$_pname"
+            else cfg_set llm.profile ""; fi
+            MSG="model: $(basename "$rest")"
+            # Restarting is the point -- the server has to load other weights --
+            # so this is deliberately not a silent config write.
+            if [[ ${STATUS[llm]:-off} == on && -z ${TASK_PID[llm]:-} ]]; then
+                start_task llm restart
+            fi
+            refresh_status; write_state ;;
         profile)
             # Switch the active model profile. Restarting the feature is the
             # whole point -- the server has to reload different weights -- so
@@ -414,7 +472,7 @@ handle_cmd() {
                 start_task llm restart
             fi
             refresh_status; write_state ;;
-        refresh) refresh_status; write_state ;;
+        refresh) scan_models; refresh_status; write_state ;;
         done)    : ;;                      # wake only; reap happens at loop top
         note)
             # A running toggle reported progress. Only meaningful while it is
@@ -503,6 +561,45 @@ check_deadlines() {
         if [[ -n ${TASK_FORCED[$id]:-} ]]; then abandon_task "$id"
         else expire_task "$id"; fi
     done
+}
+
+# The models available to the llm feature. Discovered, not declared: a config
+# file listing models goes stale the moment one is downloaded or deleted, and
+# the stale entry stays invisible until something fails to start.
+scan_models() {
+    local dirs d
+    dirs=$(cfg_text llm.models_dir); dirs="${dirs:-$HOME/models}"
+    local -a roots=()
+    while IFS= read -r d; do [[ -n $d ]] && roots+=("$d"); done \
+        < <(tr ':' '\n' <<<"$dirs")
+    (( ${#roots[@]} )) || { MODELS_TSV=""; return 0; }
+    MODELS_TSV=$(python3 "$ROOT/lib/gguf-scan.py" "${roots[@]}" 2>/dev/null)
+}
+
+# The model that will load next. llm.model holds it, but a config written
+# before models were discovered selects through a profile instead -- so resolve
+# that first and fall back, rather than showing nothing selected on a setup that
+# has been working for weeks.
+selected_model() {
+    local prof v
+    prof=$(cfg_text llm.profile)
+    if [[ -n $prof ]]; then
+        v=$(cfg_text "llm.profile.$prof.model")
+        [[ -n $v ]] && { printf '%s' "$v"; return 0; }
+    fi
+    cfg_text llm.model
+}
+
+# What the running server actually loaded, which is not always what the config
+# selects -- the two diverge whenever the model is changed without a restart.
+# Read from the running process rather than over HTTP, so it is right even
+# while the weights are still being paged in.
+loaded_model() {
+    local pid args
+    pid=$(systemctl --user show vibecontrol-llm -p MainPID --value 2>/dev/null)
+    [[ -n $pid && $pid != 0 && -r /proc/$pid/cmdline ]] || return 0
+    args=$(tr '\0' '\n' </proc/"$pid"/cmdline 2>/dev/null)
+    awk 'p { print; exit } /^-m$/ { p = 1 }' <<<"$args"
 }
 
 # True while any toggle task is still running.
@@ -603,6 +700,9 @@ check_key_clashes() {
 load_toggles
 build_cfg_keys
 check_key_clashes
+# One scan at startup so a client that never opens the model menu still has a
+# list; opening the menu sends `scan` and refreshes it.
+scan_models
 refresh_status
 write_state
 

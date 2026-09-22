@@ -10,6 +10,7 @@ import sys
 
 raw = {"daemon": {}, "toggles": {}, "groups": {}, "config": {}, "presets": {}, "msg": "",
        "graphical": "0", "llm_profile": "", "profiles": {},
+       "llm_model": "", "llm_loaded": "", "models": {},
        "hidden": set(), "on_boot": "", "on_resume": ""}
 
 for line in sys.stdin:
@@ -25,6 +26,14 @@ for line in sys.stdin:
         raw["graphical"] = value
     elif key == "llm_profile":
         raw["llm_profile"] = value
+    elif key == "llm_model":
+        raw["llm_model"] = value
+    elif key == "llm_loaded":
+        raw["llm_loaded"] = value
+    elif key.startswith("m."):
+        # m.<n>.<field>=value -- discovered models, ordered by the daemon
+        _, index, field = key.split(".", 2)
+        raw["models"].setdefault(int(index), {})[field] = value
     elif key.startswith("lp."):
         # lp.<profile>.<field>=value
         _, name, field = key.split(".", 2)
@@ -78,7 +87,24 @@ doc = {
     },
     "config": raw["config"],
     "presets": raw["presets"],
-    "llm": {"profile": raw["llm_profile"] or None, "profiles": raw["profiles"]},
+    "llm": {
+        "profile": raw["llm_profile"] or None,
+        "profiles": raw["profiles"],
+        # selected is what loads next; loaded is what the running server has.
+        # They differ whenever the model changed without a restart, and a client
+        # that shows only one of them will sometimes show the wrong thing.
+        "selected": raw["llm_model"] or None,
+        "loaded": raw["llm_loaded"] or None,
+        "models": [
+            {
+                "path": m.get("path", ""),
+                "name": m.get("name") or "",
+                "arch": m.get("arch") or "?",
+                "size": int(m["size"]) if m.get("size") else 0,
+            }
+            for _, m in sorted(raw["models"].items())
+        ],
+    },
     # Presets the daemon applies on its own, and which of them to keep out of a
     # client's preset matrix.
     "auto": {"on_boot": raw["on_boot"] or None, "on_resume": raw["on_resume"] or None,

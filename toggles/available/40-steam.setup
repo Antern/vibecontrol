@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# steam feature: Remote Play needs rather more than the -pipewire flag this
+# toggle switches. See 40-steam.md; the decisive one is the client-side
+# resolution cap, not anything installed here.
+set -uo pipefail
+case "${1:-}" in
+phases) printf 'check\nroot-install\nroot-uninstall\n' ;;
+check)
+    command -v steam >/dev/null 2>&1 || { echo "steam not installed"; exit 1; }
+    # Fedora strips H.264/HEVC *encode* from Mesa for patent reasons, so without
+    # the freeworld drivers Remote Play falls back to software x264.
+    rpm -q mesa-va-drivers-freeworld >/dev/null 2>&1 \
+        || { echo "mesa-va-drivers-freeworld missing (hardware encode unavailable)"; exit 1; } ;;
+root-install)
+    firewall-cmd --permanent --add-port=27031-27036/udp >/dev/null 2>&1
+    firewall-cmd --permanent --add-port=27036-27037/tcp >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && echo "opened Remote Play ports" ;;
+root-uninstall)
+    firewall-cmd --permanent --remove-port=27031-27036/udp >/dev/null 2>&1
+    firewall-cmd --permanent --remove-port=27036-27037/tcp >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && echo "closed Remote Play ports" ;;
+*) echo "usage: $0 {phases|check|root-install|root-uninstall}" >&2; exit 2 ;;
+esac

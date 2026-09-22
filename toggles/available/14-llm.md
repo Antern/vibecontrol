@@ -178,6 +178,32 @@ one yourself and point the config at it:
 
     umask 077; openssl rand -hex 32 > ~/.config/vibecontrol/llm.key
 
+## Models are discovered, not listed
+
+`llm.models_dir` (colon-separated, default `~/models`) is scanned for `.gguf`
+files whenever a client opens the model menu. Every file found is a row, so a
+model downloaded five minutes ago is selectable without editing anything, and
+one that was deleted is simply absent rather than a row that fails when picked.
+Vision projectors and shard parts after the first are skipped.
+
+Each row shows size, quant and **architecture**, the last read from the GGUF
+header. That is the string llama.cpp looks up when loading, and a build that
+does not implement it refuses the file outright -- having it in the menu turns
+"this cannot load here" into something visible before you pick it rather than a
+failed start afterwards.
+
+The menu distinguishes two things a single mark would conflate:
+
+    * loaded      what the running server actually has, read from its -m argument
+    > selected    what the config says will load next
+
+They differ whenever the model was changed without a restart.
+
+Selecting a model writes `llm.model`. If a `llm.profile.<name>.model=` block
+names the same file, that profile is activated too and supplies its `ctx` and
+`alias`; otherwise the plain `llm.*` defaults apply. Profiles are therefore
+optional per-model overrides rather than the source of the list.
+
 ## Config keys
 
 All in `~/.config/vibecontrol/config`, read at toggle time, nothing hardcoded:

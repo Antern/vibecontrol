@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# sshd feature: lets this user start and stop sshd without a password.
+#
+# pkexec is deliberately not used for this. pkexec needs a polkit *agent*, which
+# is a desktop component, so it would stop working exactly when the desktop is
+# off -- which is when remote access matters most, and contradicts the feature
+# being category="common".
+set -uo pipefail
+RULE=/etc/polkit-1/rules.d/49-vibecontrol-sshd.rules
+USER_NAME="${VC_TARGET_USER:-${SUDO_USER:-$USER}}"
+
+case "${1:-}" in
+phases) printf 'check\nroot-install\nroot-uninstall\n' ;;
+check)
+    systemctl cat sshd.service >/dev/null 2>&1 || { echo "sshd not installed"; exit 1; }
+    [[ -e $RULE ]] || { echo "polkit rule not installed"; exit 1; } ;;
+root-install)
+    install -d -m 0755 /etc/polkit-1/rules.d
+    cat >"$RULE" <<RULE
+// Installed by vibecontrol (toggles/available/13-sshd.setup).
+// Scoped to one unit and three verbs: whether sshd starts at boot still
+// requires admin authentication, only runtime start/stop is delegated.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") return polkit.Result.NOT_HANDLED;
+    if (subject.user !== "$USER_NAME") return polkit.Result.NOT_HANDLED;
+    if (action.lookup("unit") !== "sshd.service") return polkit.Result.NOT_HANDLED;
+    var verb = action.lookup("verb");
+    if (verb === "start" || verb === "stop" || verb === "restart") return polkit.Result.YES;
+    return polkit.Result.NOT_HANDLED;
+});
+RULE
+    chmod 0644 "$RULE"; echo "installed $RULE" ;;
+root-uninstall)
+    rm -f "$RULE" && echo "removed $RULE" ;;
+*) echo "usage: $0 {phases|check|root-install|root-uninstall}" >&2; exit 2 ;;
+esac
