@@ -125,7 +125,7 @@ run_root_phase() {
         has_phase "$id" root-uninstall || continue
         any=1
         printf '  %s%s%s\n' "$C_B" "$id" "$C_0"
-        VC_TARGET_USER="${SUDO_USER:-$USER}" run_phase "$id" root-uninstall \
+        VC_TARGET_USER="${SUDO_USER:-$VC_USER}" run_phase "$id" root-uninstall \
             || warn "$id: root step failed"
     done
     (( any )) || skip "nothing to do"

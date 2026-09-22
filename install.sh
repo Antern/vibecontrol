@@ -163,23 +163,45 @@ enable_daemon() {
         systemctl --user enable --now vibecontrol-daemon.service 2>/dev/null \
             && step "enabled and started vibecontrol-daemon"
     fi
-    loginctl show-user "$USER" -p Linger --value 2>/dev/null | grep -qx yes \
+    loginctl show-user "$VC_USER" -p Linger --value 2>/dev/null | grep -qx yes \
         || warn "linger is off: the daemon dies with your session (the desktop toggle needs it)"
 }
 
 # ------------------------------------------------------------------- root --
+# Which features this user has installed. The manifest is authoritative, but
+# it lives in their home and this phase runs as root -- if it cannot be read
+# the honest answer is to say so, not to report success having done nothing.
+# Falling back to what is actually linked keeps a hand-made install working.
+root_targets() {
+    local any=0 id f
+    while read -r id; do [[ -n $id ]] && { printf '%s\n' "$id"; any=1; }; done < <(manifest_read)
+    (( any )) && return 0
+    for f in "$VC_TOGGLE_DIR"/*.toggle; do
+        [[ -e $f ]] || continue
+        toggle_id "$f"; any=1
+    done
+    (( any )) || return 1
+}
+
 run_root_phase() {
-    local id any=0
+    local id any=0 found=0
     say "${C_B}privileged steps${C_0}"
+    say "  ${C_D}for ${VC_CFG_DIR/#$HOME/\~} (user: ${SUDO_USER:-$VC_USER})${C_0}"
     while read -r id; do
         [[ -n $id ]] || continue
+        found=1
         has_phase "$id" root-install || continue
         any=1
         printf '  %s%s%s\n' "$C_B" "$id" "$C_0"
-        VC_TARGET_USER="${SUDO_USER:-$USER}" run_phase "$id" root-install \
+        VC_TARGET_USER="${SUDO_USER:-$VC_USER}" run_phase "$id" root-install \
             || warn "$id: root step failed"
-    done < <(manifest_read)
-    (( any )) || skip "nothing to do"
+    done < <(root_targets)
+    if (( ! found )); then
+        die "no installed features found under $VC_CFG_DIR
+  Nothing was done. Run ./install.sh as your own user first, or check that
+  \$SUDO_USER is the account you installed as."
+    fi
+    (( any )) || skip "no feature needs privileged setup"
 }
 
 # ------------------------------------------------------------------- main --

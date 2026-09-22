@@ -12,6 +12,9 @@ VC_AVAILABLE="$VC_ROOT/toggles/available"
 VC_BIN="$HOME/.local/bin"
 VC_USER_UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 VC_DESKTOP="$HOME/.local/share/applications"
+# $USER is not guaranteed: su -c, cron and some service contexts leave it
+# unset, and `set -u` aborts on it. id -un always answers.
+VC_USER="${USER:-$(id -un)}"
 
 if [[ -t 1 ]]; then
     C_B=$'\033[1m'; C_D=$'\033[2m'; C_G=$'\033[32m'; C_Y=$'\033[33m'

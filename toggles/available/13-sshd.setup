@@ -7,7 +7,7 @@
 # being category="common".
 set -uo pipefail
 RULE=/etc/polkit-1/rules.d/49-vibecontrol-sshd.rules
-USER_NAME="${VC_TARGET_USER:-${SUDO_USER:-$USER}}"
+USER_NAME="${VC_TARGET_USER:-${SUDO_USER:-$(id -un)}}"
 
 case "${1:-}" in
 phases) printf 'check\nroot-install\nroot-uninstall\n' ;;
