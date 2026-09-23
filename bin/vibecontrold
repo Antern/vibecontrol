@@ -630,7 +630,16 @@ apply_preset() {
     # application forgets previous failures; a replay must not, or it retries
     # what just failed and never terminates.
     local name="$1" replay="${2:-}" line id target changed=0 blocked=0 deferred=0 unavail=0 env_up=0
-    [[ $replay == replay ]] || PRESET_FAILED=()
+    # Read the world before deciding what differs from it. A preset skips any
+    # toggle already at its target, and that judgement is worthless against a
+    # cached status: after a suspend the hotspot is down while STATUS still says
+    # on, so on_resume applied the startup preset, decided there was nothing to
+    # do, and left the machine unreachable while reporting it was up. A replay
+    # skips this because reap_tasks has just refreshed.
+    if [[ $replay != replay ]]; then
+        PRESET_FAILED=()
+        refresh_status
+    fi
     # Two late sets, and the order between them is the point: whatever releases
     # a resource must finish before whatever consumes it starts. One shared list
     # ordered by position in the config file started the LLM while the desktop

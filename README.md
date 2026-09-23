@@ -205,6 +205,14 @@ started as a daemon child and stopped with it.
 Re-applying is safe by construction -- a preset only acts on toggles whose
 state differs -- so the same preset can serve both.
 
+A preset re-reads every feature's status before deciding what differs. That is
+not an optimisation detail: a preset skips whatever is already at its target,
+and after a suspend the cached status is a description of the world before the
+machine went to sleep. The hotspot comes back down while the daemon still
+believes it is up, so `on_resume` applied its preset, concluded there was
+nothing to do, and left the machine unreachable while reporting otherwise. The
+retry schedule did not help either -- every pass read the same stale value.
+
 ## Host prerequisites
 
 Some features need things installed on the machine itself. A feature with
