@@ -100,10 +100,40 @@ cfg_set() {
 # sway and so on -- nothing here knows about any particular desktop. Set
 # VIBECONTROL_ASSUME_HEADLESS=1 to exercise the headless path.
 GRAPHICAL=0
+# WAYLAND_DISPLAY and DISPLAY as the current session has them, for features that
+# talk to the compositor.
+#
+# The daemon cannot inherit these. A process's environment is fixed at exec, and
+# this one is routinely started while there is no session at all -- the desktop
+# feature stops and starts Plasma, and any restart in between leaves the daemon
+# without them forever. Plasma's import-environment updates the user manager's
+# environment block, which only affects services started afterwards. So the
+# values are read at refresh time instead of trusted from startup; without them
+# kscreen-doctor does not fail gracefully, it aborts inside Qt.
+declare -a SESSION_ENV=()
+read_session_env() {
+    SESSION_ENV=()
+    local w d s run="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    w=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^WAYLAND_DISPLAY=//p' | tail -1)
+    # The manager can name a socket that no longer exists, after a session has
+    # come and gone; trust the socket over the variable.
+    if [[ -z $w || ! -S $run/$w ]]; then
+        w=""
+        for s in "$run"/wayland-*; do
+            [[ -S $s ]] || continue
+            w=$(basename "$s"); break
+        done
+    fi
+    [[ -n $w ]] && SESSION_ENV+=("WAYLAND_DISPLAY=$w")
+    d=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DISPLAY=//p' | tail -1)
+    [[ -n $d ]] && SESSION_ENV+=("DISPLAY=$d")
+}
+
 detect_session() {
     if [[ ${VIBECONTROL_ASSUME_HEADLESS:-0} == 1 ]]; then GRAPHICAL=0; return; fi
     [[ $(systemctl --user is-active graphical-session.target 2>/dev/null) == active ]] \
         && GRAPHICAL=1 || GRAPHICAL=0
+    (( GRAPHICAL )) && read_session_env || SESSION_ENV=()
 }
 # A wm feature is unusable with no desktop around; a common one always works.
 available() {
@@ -167,7 +197,13 @@ vc_progress() {
 # The note lands in a file the daemon reads when the task wakes it, so nothing
 # here blocks and a toggle that never calls it behaves exactly as before.
 toggle_call() {
-    ( set +u; source "${T_FILE[$1]}" 2>/dev/null
+    ( set +u
+      # Only wm features get these. A common feature must work with no session
+      # at all, and handing it a stale display would be a way to break that.
+      if [[ ${T_CAT[$1]} == wm ]]; then
+          for _kv in "${SESSION_ENV[@]}"; do export "${_kv?}"; done
+      fi
+      source "${T_FILE[$1]}" 2>/dev/null
       declare -F "t_$2" >/dev/null || exit 3
       "t_$2" )
 }
@@ -325,7 +361,11 @@ run_target() {
         # get there provides t_force; otherwise the ordinary path is simply
         # tried again, now that whatever was hanging has been killed.
         local want="${target#force-}"
-        ( set +u; source "${T_FILE[$id]}" 2>/dev/null
+        ( set +u
+          if [[ ${T_CAT[$id]} == wm ]]; then
+              for _kv in "${SESSION_ENV[@]}"; do export "${_kv?}"; done
+          fi
+          source "${T_FILE[$id]}" 2>/dev/null
           if declare -F t_force >/dev/null; then t_force "$want"; else "t_$want"; fi )
         rc=$?
         (( rc != 0 )) && { printf 'Could not force %s %s' "${T_LABEL[$id]}" "$want"; return 1; }

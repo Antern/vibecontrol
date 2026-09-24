@@ -92,6 +92,18 @@ Detection uses `graphical-session.target`, the generic systemd signal every
 desktop sets, so nothing here is tied to KDE or any other desktop. Set
 `VIBECONTROL_ASSUME_HEADLESS=1` to exercise the headless path.
 
+A `wm` feature is run with `WAYLAND_DISPLAY` and `DISPLAY` as the *current*
+session has them, read when the session is detected rather than inherited. The
+daemon cannot inherit them: a process's environment is fixed when it starts,
+this one is routinely restarted while there is no session -- the desktop
+feature stops and starts Plasma -- and the `import-environment` a session runs
+at startup only reaches services launched after it. Without this, a daemon
+restarted while headless leaves every compositor-facing feature broken once the
+desktop comes back, and `kscreen-doctor` does not degrade in that state, it
+aborts inside Qt. The socket is trusted over the variable, since the manager
+can still name one a previous session left behind. `common` features are
+deliberately not given these: they have to work with no session at all.
+
 Detection is re-run on every status refresh, not once at startup, so a desktop
 that goes away mid-run is noticed without restarting the daemon.
 
