@@ -145,6 +145,12 @@ install_toggles() {   # ids...
 prune_toggles() {   # selected ids...
     local want=" $* " f id
     for f in "$VC_TOGGLE_DIR"/*.toggle; do
+        # -e follows the link, so a dangling one fails it. Handled first and
+        # unconditionally: renaming a feature's file leaves a link whose id
+        # still matches the selection, so the check below would keep it.
+        if [[ -L $f && ! -e $f ]]; then
+            rm -f "$f"; step "removed dangling link ${f##*/}"; continue
+        fi
         [[ -e $f ]] || continue
         id=$(toggle_id "$f")
         [[ $want == *" $id "* ]] && continue
