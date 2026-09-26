@@ -8,7 +8,8 @@
 #
 #   ./install.sh                 pick toggles interactively, install them
 #   ./install.sh --all           every toggle, no prompt
-#   ./install.sh --toggles=a,b   just these
+#   ./install.sh --toggles=a,b   exactly these, unlinking anything else
+#   ./install.sh --add=a,b       these as well as what is already installed
 #   ./install.sh --list          show what is available and skip installing
 #   sudo ./install.sh --root     the privileged steps, after the above
 #
@@ -30,13 +31,14 @@ fi
 # shellcheck source=lib/setup-common.sh
 source "$VC_ROOT/lib/setup-common.sh"
 
-MODE=install SELECT="" WANT_ALL=0
+MODE=install SELECT="" ADD="" WANT_ALL=0
 for arg in "$@"; do
     case "$arg" in
         --root)       MODE=root ;;
         --all)        WANT_ALL=1 ;;
         --list)       MODE=list ;;
         --toggles=*)  SELECT="${arg#--toggles=}" ;;
+        --add=*)      ADD="${arg#--add=}" ;;
         -h|--help)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            die "unknown argument: $arg" ;;
     esac
@@ -225,7 +227,12 @@ say ""
 show_table
 say ""
 
-if (( WANT_ALL )); then
+if [[ -n $ADD ]]; then
+    # Added to what is already installed rather than replacing it. --toggles= is
+    # a complete selection and unlinks the rest, which is right for an install
+    # and wrong for adding one feature to a working machine.
+    mapfile -t CHOSEN < <({ manifest_read; parse_selection "$ADD"; } | awk '!seen[$0]++')
+elif (( WANT_ALL )); then
     mapfile -t CHOSEN < <(printf '%s\n' "${IDS[@]}")
 elif [[ -n $SELECT ]]; then
     mapfile -t CHOSEN < <(parse_selection "$SELECT")

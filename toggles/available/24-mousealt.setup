@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Writes the input-remapper preset that the mousealt feature switches on.
+#
+# The preset is generated rather than shipped because the button, the key it
+# should produce and the device name are all config, and because it needs an
+# origin_hash -- input-remapper's identifier for which sub-device an event comes
+# from. That hash is taken from any preset already present for the same device,
+# which is more reliable than asking someone to find it.
+set -uo pipefail
+CFG="${VC_CFG_DIR:-$HOME/.config/vibecontrol}/config"
+IR="$HOME/.config/input-remapper-2"
+
+cfgv() { grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2-; }
+cfg_default() {
+    grep -qE "^$1=" "$CFG" 2>/dev/null && return 0
+    mkdir -p "$(dirname "$CFG")"; printf '%s=%s\n' "$1" "$2" >>"$CFG"; echo "config: $1=$2"
+}
+
+case "${1:-}" in
+phases) printf 'check\ninstall\nuninstall\n' ;;
+check)
+    command -v input-remapper-control >/dev/null 2>&1 || { echo "input-remapper not installed"; exit 1; }
+    [[ $(systemctl is-active input-remapper 2>/dev/null) == active ]] \
+        || { echo "input-remapper service not running"; exit 1; }
+    ;;
+install)
+    cfg_default mousealt.device "Logitech G502"
+    cfg_default mousealt.preset vibecontrol-mousealt
+    # BTN_SIDE is the back button on a stock G502. If the mouse's onboard memory
+    # has been programmed the button may send something else entirely, which is
+    # why this is a config key and not a constant -- see the feature's notes.
+    cfg_default mousealt.button BTN_SIDE
+    cfg_default mousealt.output KEY_LEFTALT
+    dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
+    btn=$(cfgv mousealt.button); out=$(cfgv mousealt.output)
+    python3 - "$IR" "$dev" "$preset" "$btn" "$out" <<'PY'
+import glob, json, os, sys
+ir, dev, preset, btn, out = sys.argv[1:6]
+try:
+    from evdev import ecodes
+except ImportError:
+    sys.exit("python3-evdev is needed to turn a button name into a code")
+code = ecodes.ecodes.get(btn)
+if code is None:
+    sys.exit("unknown button name: %s" % btn)
+d = os.path.join(ir, "presets", dev)
+os.makedirs(d, exist_ok=True)
+# Reuse the origin_hash from a sibling preset: it identifies the sub-device the
+# events arrive on, and getting it wrong means the mapping never fires.
+origin = None
+for f in glob.glob(os.path.join(d, "*.json")):
+    if os.path.basename(f) == preset + ".json":
+        continue
+    try:
+        for m in json.load(open(f)):
+            for c in m.get("input_combination", []):
+                if c.get("origin_hash"):
+                    origin = c["origin_hash"]; raise StopIteration
+    except StopIteration:
+        break
+    except Exception:
+        continue
+combo = {"type": 1, "code": code}
+if origin:
+    combo["origin_hash"] = origin
+path = os.path.join(d, preset + ".json")
+json.dump([{
+    "input_combination": [combo],
+    "target_uinput": "keyboard",
+    # A bare key name holds that key for as long as the button is held, which is
+    # what a modifier has to do; a macro would fire once and release.
+    "output_symbol": out,
+    "name": "vibecontrol: %s as %s" % (btn, out),
+    "mapping_type": "key_macro",
+}], open(path, "w"), indent=4)
+print("wrote %s (%s code %d -> %s, origin_hash %s)"
+      % (path, btn, code, out, origin or "none found"))
+PY
+    : ;;
+uninstall)
+    dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
+    f="$IR/presets/$dev/${preset:-vibecontrol-mousealt}.json"
+    [[ -f $f ]] && { rm -f "$f"; echo "removed $f"; } || echo "no preset to remove"
+    : ;;
+*) echo "usage: $0 {phases|check|install|uninstall}" >&2; exit 2 ;;
+esac

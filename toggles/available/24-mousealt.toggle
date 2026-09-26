@@ -1,0 +1,72 @@
+category="wm"
+label="Mouse back = Alt"
+group="mousealt"
+section="desktop"
+# A modifier key only means anything with a desktop in front of it, so it hangs
+# off the feature that owns one -- even though input-remapper itself is a system
+# service and would happily inject into nothing.
+parent="desktop"
+timeout=20
+
+# Done through input-remapper rather than a small evdev reader of our own,
+# because the hard part is not producing Alt -- it is *suppressing* the button's
+# original action. That needs an exclusive grab of the device and faithful
+# re-emission of everything else, which is precisely what input-remapper is, and
+# it is already installed and running as a system service.
+#
+# Config, so none of it is baked in:
+#   mousealt.device = Logitech G502          (key from --list-devices)
+#   mousealt.preset = vibecontrol-mousealt
+#   mousealt.button = BTN_SIDE               (what the button actually sends)
+#   mousealt.output = KEY_LEFTALT
+#
+# If the button does nothing once this is on, the button name is the thing to
+# check first: a G502 with programmed onboard memory can send anything, and this
+# machine already has a preset built around a button that emits KEY_INSERT.
+# Find the real one with:
+#   sudo python3 -c "import evdev;d=evdev.InputDevice('/dev/input/event8')
+#   [print(evdev.categorize(e)) for e in d.read_loop() if e.type==1 and e.value==1]"
+
+_dev()    { local v; v=$(cfg_text mousealt.device); echo "${v:-Logitech G502}"; }
+_preset() { local v; v=$(cfg_text mousealt.preset); echo "${v:-vibecontrol-mousealt}"; }
+_marker() { echo "${XDG_RUNTIME_DIR:-/tmp}/vibecontrol/mousealt.on"; }
+
+# input-remapper creates virtual devices while it is injecting, so their presence
+# says injection is live. It does not say whose preset it is -- the control CLI
+# has no status command at all -- hence the marker, which says the injection is
+# ours. Both are needed: the marker alone would survive the service restarting,
+# and the virtual device alone would report true for somebody else's preset.
+_injecting() { grep -qi "input-remapper" /proc/bus/input/devices 2>/dev/null; }
+
+t_status() {
+    [[ -f $(_marker) ]] && _injecting && echo on || echo off
+}
+
+t_on() {
+    command -v input-remapper-control >/dev/null 2>&1 || return 2
+    local ir="$HOME/.config/input-remapper-2/presets/$(_dev)/$(_preset).json"
+    # rc 2 is "not configured" rather than "failed": there is nothing to retry
+    # until the preset exists, and the daemon reports it as unavailable.
+    [[ -f $ir ]] || return 2
+    vc_progress "loading $(_preset)"
+    input-remapper-control --command start --device "$(_dev)" --preset "$(_preset)" \
+        >/dev/null 2>&1 || return 1
+    mkdir -p "$(dirname "$(_marker)")"; : > "$(_marker)"
+    # The CLI returns before the injector is up, so confirm rather than assume.
+    local i
+    for i in $(seq 1 10); do _injecting && return 0; sleep 1; done
+    rm -f "$(_marker)"
+    return 1
+}
+
+t_off() {
+    rm -f "$(_marker)"
+    command -v input-remapper-control >/dev/null 2>&1 || return 0
+    # autoload rather than stop: this machine's config autoloads a macro preset
+    # for the same mouse, and stopping outright would silently take that away
+    # too. autoload puts back whatever the config says should be there, so this
+    # feature is a temporary override rather than something that clears the slate.
+    input-remapper-control --command stop --device "$(_dev)" >/dev/null 2>&1
+    input-remapper-control --command autoload >/dev/null 2>&1
+    return 0
+}
