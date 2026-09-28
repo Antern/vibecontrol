@@ -217,6 +217,16 @@ started as a daemon child and stopped with it.
 Re-applying is safe by construction -- a preset only acts on toggles whose
 state differs -- so the same preset can serve both.
 
+After a suspend the hotspot needs more than a retry. NetworkManager reports the
+wifi device as unavailable while the driver and supplicant come back, and asking
+for an AP in that window does not queue: it proceeds, spends twenty-five seconds
+and fails with `supplicant-timeout`. The feature therefore waits for the device
+to reach at least state 30 (disconnected) before activating, and retries once
+after that -- the device can report itself available while the supplicant still
+needs a moment. Worth knowing when reading a failure report: the polkit audit
+line says `result="success"`, so a notification that only says "activation
+failed" makes this look like a permissions problem when it is a timing one.
+
 A preset re-reads every feature's status before deciding what differs. That is
 not an optimisation detail: a preset skips whatever is already at its target,
 and after a suspend the cached status is a description of the world before the

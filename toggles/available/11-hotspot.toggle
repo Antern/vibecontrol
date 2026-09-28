@@ -2,13 +2,59 @@ category="common"
 label="Hotspot"
 group="hotspot"
 section="server"
-timeout=60
+# Generous, because this waits for hardware: up to 30s for the radio to become
+# available, then two activation attempts of 30s each.
+timeout=120
 # Never rollback: this link carries the SSH session the machine is often being
 # driven over, and rolling back a failed "on" means taking it down. Forcing
 # just tries again, which is the only safe direction here.
 on_timeout=force
-t_status() { [[ $(nmcli -g GENERAL.STATE con show Hotspot 2>/dev/null) == activated ]] && echo on || echo off; }
-# -w bounds nmcli inside the task deadline; its own default is 90s, which
-# would let the daemon kill the task while NetworkManager was still working.
-t_on()     { nmcli -w 40 con up   Hotspot >/dev/null 2>&1; }
-t_off()    { nmcli -w 40 con down Hotspot >/dev/null 2>&1; }
+_con="Hotspot"
+
+t_status() { [[ $(nmcli -g GENERAL.STATE con show "$_con" 2>/dev/null) == activated ]] && echo on || echo off; }
+
+# The interface is read from the connection rather than named here, so this
+# works on a machine whose wifi device is called something else.
+_iface() { nmcli -g connection.interface-name con show "$_con" 2>/dev/null; }
+
+# Wait for the radio to be usable before asking for an AP.
+#
+# This is what fails after a suspend. NetworkManager's numeric device states run
+# 20 unavailable, 30 disconnected, 100 connected; below 30 the driver and
+# supplicant are still coming back. Asking for an AP then does not queue and
+# wait -- it proceeds, spends 25 seconds, and fails with supplicant-timeout:
+#
+#   audit: op="connection-activate" uid=1000 result="success"
+#   Activation: (wifi) Hotspot network creation took too long, failing activation
+#   state change: config -> failed (reason 'supplicant-timeout')
+#
+# Note the audit line: authorization succeeds, so a failure here looks like a
+# permissions problem in any notification that only reports "activation failed".
+_radio_ready() {
+    local i s dev
+    dev=$(_iface)
+    [[ -n $dev ]] || return 0          # cannot tell; let nmcli decide
+    for i in $(seq 1 30); do
+        s=$(nmcli -g GENERAL.STATE device show "$dev" 2>/dev/null | grep -oE '^[0-9]+')
+        [[ -n $s ]] && (( s >= 30 )) && return 0
+        [[ $i == 1 ]] && vc_progress "waiting for $dev to become available"
+        sleep 1
+    done
+    return 1
+}
+
+# -w bounds nmcli inside the task deadline; its own default is 90s, which would
+# let the daemon kill the task while NetworkManager was still working.
+t_on() {
+    _radio_ready || { printf '%s is still unavailable' "$(_iface)"; return 1; }
+    vc_progress "activating $_con"
+    nmcli -w 30 con up "$_con" >/dev/null 2>&1 && return 0
+    # One retry. The device can report itself available while the supplicant
+    # still needs a moment before it will bring an AP up -- which is exactly the
+    # window a resume lands in, and why the resume retries alone did not help.
+    vc_progress "activation failed, retrying"
+    sleep 5
+    nmcli -w 30 con up "$_con" >/dev/null 2>&1
+}
+
+t_off() { nmcli -w 30 con down "$_con" >/dev/null 2>&1; }
