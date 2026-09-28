@@ -274,6 +274,14 @@ can be prepared before anything is toggled.
   needed) and waits for logind to release the seat. Sessions are matched on
   `Type=tty`: Plasma occupies the same VT under the same user, and matching on
   the VT alone would select the live desktop.
+- **Caps Lock as Ctrl in Wine games** -- `install/caps-to-ctrl.sh`, run once as
+  root. A desktop remap (`caps:ctrl_modifier` in KDE) is an XKB option, and XKB
+  maps keycodes to *symbols*; Wine converts X11 keycodes into DirectInput
+  scancodes through a fixed table and never consults the symbol map, so a game
+  reading scancodes still sees Caps Lock. An hwdb entry rewrites the scancode in
+  the kernel instead, below evdev, so XKB, Wayland, XWayland, Wine and the text
+  console all agree. Remapping in the keyboard's own firmware is better still
+  where the hardware allows it.
 - **Mouse scrolling in Wine games** -- `install/mouse-scroll-quirk.sh`, run once
   as root. A wheel that reports `REL_WHEEL_HI_RES` gives the Wayland desktop
   smooth scrolling, but a Wine game receives input through XWayland, which folds
