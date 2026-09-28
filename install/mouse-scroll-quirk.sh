@@ -27,6 +27,26 @@ F=/etc/libinput/local-overrides.quirks
 
 [[ $(id -u) == 0 ]] || { echo "run with sudo" >&2; exit 2; }
 
+# --undo removes the block again. Worth having: this quirk did nothing on the
+# machine it was written for, and AttrEventCodeDisable appears in none of
+# libinput's own shipped quirks -- so leaving it behind would be misleading
+# config in /etc rather than a fix.
+if [[ ${1:-} == --undo ]]; then
+    [[ -f $F ]] || { echo "nothing to undo"; exit 0; }
+    # Drops our comment lines and section, up to the next section or EOF.
+    awk -v name="$NAME" '
+        $0 ~ ("^# vibecontrol: " name)            { skip = 1 }
+        skip && /^\[/ && $0 !~ ("vibecontrol " name) { skip = 0 }
+        !skip
+    ' "$F" >"$F.tmp" && mv -f "$F.tmp" "$F"
+    # An empty file is litter; libinput does not need it to exist.
+    [[ -s $F ]] || rm -f "$F"
+    echo "removed the vibecontrol block from $F"
+    udevadm control --reload-rules 2>/dev/null || true
+    echo "replug the mouse, or restart the session, for libinput to re-read it"
+    exit 0
+fi
+
 install -d -m 0755 /etc/libinput
 if [[ -f $F ]] && grep -q "vibecontrol: $NAME" "$F"; then
     echo "already present in $F"; exit 0
