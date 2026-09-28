@@ -274,6 +274,14 @@ can be prepared before anything is toggled.
   needed) and waits for logind to release the seat. Sessions are matched on
   `Type=tty`: Plasma occupies the same VT under the same user, and matching on
   the VT alone would select the live desktop.
+- **Mouse scrolling in Wine games** -- `install/mouse-scroll-quirk.sh`, run once
+  as root. A wheel that reports `REL_WHEEL_HI_RES` gives the Wayland desktop
+  smooth scrolling, but a Wine game receives input through XWayland, which folds
+  those 120-unit deltas back into X11 button 4/5 presses and can emit them with
+  the wrong sign at a detent boundary -- felt as scrolling that occasionally
+  jumps the other way, and as oversensitivity. The quirk disables the hi-res
+  axis for one USB id. It is system-wide by nature: desktop scrolling becomes
+  detent-based too, and a libinput quirk cannot be scoped to one application.
 - **`40-steam.toggle`** — see [`toggles/40-steam.md`](toggles/40-steam.md).
   Remote Play needs rather more than the flag this feature toggles.
 

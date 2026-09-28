@@ -17,11 +17,19 @@ cfg_default() {
 }
 
 case "${1:-}" in
-phases) printf 'check\ninstall\nuninstall\n' ;;
+phases) printf 'check\ninstall\nuninstall\nroot-install\nroot-uninstall\n' ;;
 check)
     command -v input-remapper-control >/dev/null 2>&1 || { echo "input-remapper not installed"; exit 1; }
     [[ $(systemctl is-active input-remapper 2>/dev/null) == active ]] \
         || { echo "input-remapper service not running"; exit 1; }
+    # The real readiness test. input-remapper's client calls capabilities() on
+    # each device to classify it, which means opening it -- so a device it cannot
+    # read is invisible, and start fails with "unknown ... or you are missing
+    # permissions". Input nodes are root:input; only devices tagged uaccess get
+    # an ACL for the logged-in user.
+    dev=$(cfgv mousealt.device); dev="${dev:-Logitech G502}"
+    input-remapper-control --list-devices 2>/dev/null | grep -qxF "$dev" \
+        || { echo "$dev is not visible to input-remapper (needs the uaccess rule)"; exit 1; }
     ;;
 install)
     cfg_default mousealt.device "Logitech G502"
@@ -31,6 +39,8 @@ install)
     # why this is a config key and not a constant -- see the feature's notes.
     cfg_default mousealt.button BTN_SIDE
     cfg_default mousealt.output KEY_LEFTALT
+    # USB id the uaccess rule targets, so the root phase is not hardcoded either.
+    cfg_default mousealt.usb_id 046d:c539
     dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
     btn=$(cfgv mousealt.button); out=$(cfgv mousealt.output)
     python3 - "$IR" "$dev" "$preset" "$btn" "$out" <<'PY'
@@ -76,6 +86,32 @@ json.dump([{
 print("wrote %s (%s code %d -> %s, origin_hash %s)"
       % (path, btn, code, out, origin or "none found"))
 PY
+    : ;;
+root-install)
+    # uaccess rather than adding the user to the input group. The group grants
+    # read access to every input device, keyboards included, which is a
+    # keylogging surface; uaccess is logind giving the *active session* user an
+    # ACL on this one device, and it goes away with the session.
+    usb=$(cfgv mousealt.usb_id); usb="${usb:-046d:c539}"
+    vid="${usb%%:*}"; pid="${usb##*:}"
+    f=/etc/udev/rules.d/70-vibecontrol-mousealt.rules
+    {
+      echo '# Installed by vibecontrol (toggles/available/24-mousealt.setup).'
+      echo '# Lets the logged-in user'"'"'s input-remapper client see this device: it'
+      echo '# classifies devices by opening them, so one it cannot read does not exist'
+      echo '# as far as it is concerned. Scoped to a single USB id, not the input group.'
+      printf 'SUBSYSTEM=="input", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", TAG+="uaccess"\n' "$vid" "$pid"
+    } >"$f"
+    chmod 0644 "$f"
+    udevadm control --reload-rules 2>/dev/null || true
+    # Re-runs the add event so logind applies the ACL now, not at next replug.
+    udevadm trigger --subsystem-match=input --action=add 2>/dev/null || true
+    echo "installed $f for $vid:$pid"
+    : ;;
+root-uninstall)
+    f=/etc/udev/rules.d/70-vibecontrol-mousealt.rules
+    rm -f "$f" && echo "removed $f"
+    udevadm control --reload-rules 2>/dev/null || true
     : ;;
 uninstall)
     dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
