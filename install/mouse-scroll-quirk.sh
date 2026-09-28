@@ -56,12 +56,15 @@ fi
 cat >>"$F" <<QUIRK
 
 # vibecontrol: $NAME -- no high-resolution scrolling
-# XWayland mis-signs folded hi-res deltas, which Wine games feel as scrolling
-# that occasionally goes the wrong way. Classic detents convert cleanly.
+# The key is AttrEventCode with a - prefix per code, as libinput's own quirks
+# use it (AttrEventCode=-ABS_TILT_X;). An earlier version of this script used
+# AttrEventCodeDisable, which libinput does not know: the block parsed as far
+# as libinput cared and was silently ignored, so it looked like the quirk had
+# no effect when in fact it had never been read.
 [vibecontrol $NAME no hi-res scroll]
 MatchVendor=$VENDOR
 MatchProduct=$PRODUCT
-AttrEventCodeDisable=REL_WHEEL_HI_RES;REL_HWHEEL_HI_RES;
+AttrEventCode=-REL_WHEEL_HI_RES;-REL_HWHEEL_HI_RES;
 QUIRK
 
 echo "appended to $F"
