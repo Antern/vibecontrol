@@ -1,9 +1,13 @@
 category="wm"
-label="AirPods mic switch"
+label="Headset mic autoswitch"
 group="airpods"
 section="desktop"
 # Lives in the graphical session, so it hangs off the feature that owns it.
 parent="desktop"
+# Named for the setting, not for a device: this is wireplumber's generic
+# bluetooth profile autoswitch, so it covers any bluetooth headset. The
+# toggle id stays "airpods" -- renaming it would break existing presets
+# and config keys.
 _setting="bluetooth.autoswitch-to-headset-profile"
 t_status() { LC_ALL=C wpctl settings "$_setting" 2>/dev/null | grep -qE 'Value:[[:space:]]*true' && echo on || echo off; }
 t_on()     { wpctl settings --save "$_setting" true  >/dev/null 2>&1; }

@@ -3,7 +3,7 @@ Type=Application
 Version=1.4
 Name=vibecontrol
 GenericName=Machine Modes
-Comment=Toggle server mode, AirPods mic and SM2 macro
+Comment=Switch machine modes: desktop, headless server, remote play, local LLM
 Exec=konsole --separate --hide-menubar --hide-tabbar --desktopfile vibecontrol -p TerminalColumns=88 -p TerminalRows=26 -e vibecontrol
 Icon=dashboard-show
 Terminal=false

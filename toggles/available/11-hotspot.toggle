@@ -9,7 +9,9 @@ timeout=120
 # driven over, and rolling back a failed "on" means taking it down. Forcing
 # just tries again, which is the only safe direction here.
 on_timeout=force
-_con="Hotspot"
+# NetworkManager names a shared connection "Hotspot" by default; set
+# hotspot.connection if yours is called something else.
+_con=$(cfg_text hotspot.connection); _con="${_con:-Hotspot}"
 
 t_status() { [[ $(nmcli -g GENERAL.STATE con show "$_con" 2>/dev/null) == activated ]] && echo on || echo off; }
 
