@@ -7,11 +7,12 @@ parent="desktop"
 
 # Two things move together: the desktop mode and WoW's own config.
 #
-# The desktop mode matters because black bars are an aspect mismatch. The
+# The desktop mode matters because black bars are an aspect mismatch. Here the
 # client draws into 3024x1898 (its panel minus the menu-bar strip), so a
 # desktop at exactly that size streams 1:1 with no bars and no resampling.
 # It is larger than the physical 2560x1440 panel, which the GPU accepts and
-# downscales locally -- the local view softens, the stream is exact.
+# downscales locally -- the local view softens, the stream is exact. Both
+# numbers are config; see wow.res_on / wow.res_off below.
 #
 # WoW's config is swapped as a whole file per mode rather than edited cvar by
 # cvar, so anything changed from the game's own settings menu is kept and
@@ -21,12 +22,40 @@ parent="desktop"
 # only applies to exclusive fullscreen, which under Proton also negotiates
 # display modes and was a source of errors -- hence borderless windowed.
 _mode_file="${XDG_CONFIG_HOME:-$HOME/.config}/vibecontrol/wow-mode"
-_wow="$HOME/.local/share/Steam/steamapps/compatdata/2384571406/pfx/drive_c/Program Files (x86)/World of Warcraft"
 
-_res_on="3024x1898"
-_res_off="2560x1440"
-_seed_on="gxWindow=1 GxMaximize=1 GxWindowedResolution=3024x1898 gxResolution=3024x1898 GxApi=D3D11"
-_seed_off="gxWindow=1 GxMaximize=1 GxWindowedResolution=2560x1414 gxResolution=2560x1440 GxApi=D3D11"
+# Everything below is config, defaulting to the machine this was written on:
+#
+#   wow.prefix     the WoW install inside its Proton prefix
+#   wow.res_on     desktop mode while streaming   (the client's panel)
+#   wow.res_off    desktop mode otherwise         (the physical panel)
+#   wow.seed_on    cvars written into a Config.wtf that does not exist yet
+#   wow.seed_off
+#
+# The resolutions are a pair of machines, not a universal truth: res_on is
+# whatever the *client* draws into and res_off is the host's own panel. The
+# seeds are separate keys rather than built from those two because they are
+# not derivable from them -- note GxWindowedResolution=2560x1414 against
+# gxResolution=2560x1440 below, the windowed height being the panel minus the
+# menu-bar strip.
+#
+# wow.prefix is found by globbing compatdata rather than naming an id: Steam
+# generates that id per user for a non-Steam shortcut, so a literal is
+# meaningless anywhere else. First match wins; set wow.prefix for more than one
+# install.
+_wow_default() {
+    local d
+    for d in "$HOME/.local/share/Steam/steamapps/compatdata/"*"/pfx/drive_c/Program Files (x86)/World of Warcraft"; do
+        [[ -d $d ]] && { printf '%s' "$d"; return 0; }
+    done
+}
+_wow=$(cfg_text wow.prefix); [[ -n $_wow ]] || _wow=$(_wow_default)
+
+_res_on=$(cfg_text wow.res_on);   _res_on="${_res_on:-3024x1898}"
+_res_off=$(cfg_text wow.res_off); _res_off="${_res_off:-2560x1440}"
+_seed_on=$(cfg_text wow.seed_on)
+_seed_on="${_seed_on:-gxWindow=1 GxMaximize=1 GxWindowedResolution=3024x1898 gxResolution=3024x1898 GxApi=D3D11}"
+_seed_off=$(cfg_text wow.seed_off)
+_seed_off="${_seed_off:-gxWindow=1 GxMaximize=1 GxWindowedResolution=2560x1414 gxResolution=2560x1440 GxApi=D3D11}"
 
 _out() {
     kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
