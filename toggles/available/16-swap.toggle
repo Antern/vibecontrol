@@ -1,0 +1,86 @@
+category="common"
+label="Swap (zram)"
+group="swap"
+section="local ai"
+timeout=60
+# Enables and disables the zram swap device.
+#
+# Why this is worth a toggle: swap here is /dev/zram0, a *compressed RAM*
+# device, not a disk partition -- Fedora's zram-generator-defaults sets it up
+# as min(ram, 8192). Compressed RAM is a good trade on ordinary desktop data
+# (it was getting 2.7:1 when this was written), so for desktop work it stays
+# on: it is the safety net that keeps a memory spike from becoming an OOM.
+#
+# It is a bad trade under the local LLM. Quantized weights and KV pages are
+# high-entropy, and on 2026-10-12 lzo-rle managed 1.04:1 on them -- zram held
+# 7.7G of swap by consuming 7.4G of real RAM, feeding the pressure it was
+# supposed to relieve. That spiral ended in the *global* oom-killer taking
+# llama-server down and the machine's memory with it. Headless, serving one
+# model over wifi, there is nothing to protect and the 8G is better left as
+# plain RAM, so the headless-ai preset turns this off.
+#
+# Status reports the thing it controls, not the unit: on means swap is active.
+#
+# Sits in the "local ai" section next to the GPU power cap rather than under
+# "server": both exist for the same reason -- the machine is tuned for serving
+# one model -- and splitting them hid that they are one decision.
+#
+# No pkexec: /etc/polkit-1/rules.d/49-vibecontrol-swap.rules lets this user
+# start and stop this one unit. pkexec needs a polkit agent, which is a desktop
+# component, and the whole point is that this works headless.
+#
+# Config:
+#   swap.unit        = dev-zram0.swap   the systemd swap unit to drive
+#   swap.max_used_mb = 2048             refuse to disable above this much in use
+#
+# dev-disk-by-diskseq-N.swap may appear beside the unit below; it is systemd
+# Following= the same device, not a second swap, and needs no handling.
+_unit() { local v; v=$(cfg_text swap.unit); echo "${v:-dev-zram0.swap}"; }
+_rule="/etc/polkit-1/rules.d/49-vibecontrol-swap.rules"
+
+# Without the rule, systemctl just fails and the menu says "could not turn off",
+# which sends you looking at swap instead of at the install step. Say it plainly.
+_authz() {
+    [[ -e $_rule ]] && return 0
+    printf 'not set up -- run: cd ~/prj/vibecontrol && sudo ./install.sh --root'
+    return 2
+}
+_max()  { local v; v=$(cfg_text swap.max_used_mb); echo "${v:-2048}"; }
+
+# Sum of the Used column across active swaps, in MiB.
+_used_mb() {
+    local kb; kb=$(awk 'NR>1 {s+=$4} END {print s+0}' /proc/swaps 2>/dev/null)
+    echo $(( kb / 1024 ))
+}
+
+# Count data lines, not file size: /proc/swaps is procfs and stats as 0 bytes,
+# so a `[[ -s /proc/swaps ]]` test is always false and inverts this toggle.
+t_status() { awk 'NR>1 {n++} END {exit !(n>0)}' /proc/swaps 2>/dev/null && echo on || echo off; }
+
+t_on() {
+    local u; u=$(_unit)
+    systemctl show "$u" >/dev/null 2>&1 || return 2
+    _authz || return 2
+    systemctl start "$u" >/dev/null 2>&1 || return 1
+    [[ $(t_status) == on ]]
+}
+
+t_off() {
+    local u; u=$(_unit)
+    systemctl show "$u" >/dev/null 2>&1 || return 2
+    _authz || return 2
+    # swapoff migrates every page in swap back into RAM before it returns, so
+    # doing this while swap is full is how you cause the OOM you are trying to
+    # avoid -- and it can block for minutes, which would just trip the toggle
+    # timeout and look like a hang. Refuse instead, and say what to do about it.
+    local used free_mb max
+    used=$(_used_mb); max=$(_max)
+    free_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+    if (( used > max )); then
+        printf 'swap holds %sM (limit %sM, %sM RAM free) -- turn this off before the load, not during' \
+            "$used" "$max" "$free_mb"
+        return 2
+    fi
+    systemctl stop "$u" >/dev/null 2>&1 || return 1
+    [[ $(t_status) == off ]]
+}

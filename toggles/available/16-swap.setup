@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# swap feature: lets this user start and stop the zram swap unit without a
+# password.
+#
+# pkexec is deliberately not used, for the same reason as sshd: pkexec needs a
+# polkit *agent*, which is a desktop component, so it would stop working in
+# exactly the mode this toggle exists for -- headless, serving the LLM -- and
+# would contradict the feature being category="common".
+set -uo pipefail
+RULE=/etc/polkit-1/rules.d/49-vibecontrol-swap.rules
+USER_NAME="${VC_TARGET_USER:-${SUDO_USER:-$(id -un)}}"
+UNIT="${VC_SWAP_UNIT:-dev-zram0.swap}"
+
+case "${1:-}" in
+phases) printf 'check\nroot-install\nroot-uninstall\n' ;;
+check)
+    systemctl show "$UNIT" >/dev/null 2>&1 || { echo "$UNIT not known to systemd"; exit 1; }
+    [[ -e $RULE ]] || { echo "polkit rule not installed"; exit 1; } ;;
+root-install)
+    install -d -m 0755 /etc/polkit-1/rules.d
+    cat >"$RULE" <<RULE
+// Installed by vibecontrol (toggles/available/16-swap.setup).
+// Scoped to one unit and two verbs: whether swap comes up at boot still
+// requires admin authentication, only runtime start/stop is delegated.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") return polkit.Result.NOT_HANDLED;
+    if (subject.user !== "$USER_NAME") return polkit.Result.NOT_HANDLED;
+    if (action.lookup("unit") !== "$UNIT") return polkit.Result.NOT_HANDLED;
+    var verb = action.lookup("verb");
+    if (verb === "start" || verb === "stop") return polkit.Result.YES;
+    return polkit.Result.NOT_HANDLED;
+});
+RULE
+    chmod 0644 "$RULE"; echo "installed $RULE" ;;
+root-uninstall)
+    rm -f "$RULE" && echo "removed $RULE" ;;
+*) echo "usage: $0 {phases|check|root-install|root-uninstall}" >&2; exit 2 ;;
+esac
