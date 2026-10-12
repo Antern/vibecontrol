@@ -32,8 +32,35 @@ OVERLAY_TTL = 15.0          # drop a local guess the daemon never confirmed
 
 C = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "rev": "\033[7m",
-    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m", "cyan": "\033[36m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "cyan": "\033[36m",
 }
+
+# One colour, one meaning -- the whole palette, so the next edit can check it:
+#   green bold  on                     dim     off / N/A / locked / preset satisfied
+#   yellow bold in flight, armed       red bold  forced
+#   cyan        a key you can press    blue bold a preset would change this row
+# Only the 16 ANSI slots are used and no background is ever painted, so the
+# user's terminal theme stays in charge. Do not reach for truecolor here.
+#
+# blue is bold because plain ANSI blue renders near-black in many dark themes.
+# It is blue rather than cyan for two reasons: cyan already means "key you can
+# press", and cyan next to a green badge is the teal/green pair that red-green
+# colour deficiency blends.
+
+
+def disable_colour():
+    """NO_COLOR, TERM=dumb and --no-color, per clig.dev. FORCE_COLOR wins.
+
+    Not TTY detection: this is a full-screen client that already requires a
+    terminal, so there is no pipe case to handle.
+    """
+    if os.environ.get("FORCE_COLOR"):
+        return
+    if (os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb"
+            or "--no-color" in sys.argv):
+        for k in C:
+            C[k] = ""
 
 
 def send(line):
@@ -313,7 +340,11 @@ class UI:
                 elif self.status_of(r.tid) == target:
                     line += C["dim"] + "%-*s" % (PRESET_CELL, target.upper()) + C["reset"]
                 else:
-                    line += (C["yellow"] + C["bold"]
+                    # Blue bold: this cell is static information -- "pressing
+                    # that key would change this row". Yellow is reserved for a
+                    # transition happening now, and cyan for a key you can press,
+                    # so neither is free. See the palette note by C.
+                    line += (C["blue"] + C["bold"]
                              + "%-*s" % (PRESET_CELL, target.upper()) + C["reset"])
             cells.append(line)
         return header, cells
@@ -749,6 +780,7 @@ class UI:
 
 
 def main():
+    disable_colour()
     os.makedirs(CLIENTS, exist_ok=True)
     fifo = os.path.join(CLIENTS, "%d.fifo" % os.getpid())
     try:
