@@ -74,6 +74,39 @@ cfg_get() {
 }
 # Free-text settings, as opposed to the 0/1 toggles cfg_get handles.
 cfg_text() { grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2-; }
+
+# The sysfs device directory of the GPU features should ask about, or nothing
+# when there is no discrete card.
+#
+# Not a hardcoded card number. DRM numbering follows probe order, so a machine
+# whose CPU has no iGPU -- or a different mix of vendors -- puts the discrete
+# card on card0 where this one puts it on card1. Nothing would crash; the
+# VRAM gates in the llm and desktop features would simply read the wrong
+# device and quietly do the wrong thing.
+#
+# Largest mem_info_vram_total wins, which is the discrete card on any machine
+# that has one: an integrated GPU reports 0 there, and amdgpu is the only
+# driver exposing the file at all, so a non-AMD card returns nothing and
+# callers fall back to their "no card" path exactly as before.
+#
+#   gpu.card = card0            override, if autodetection ever picks wrong
+#   gpu.card = /sys/class/drm/card0/device    also accepted
+vc_gpu_card() {
+    local v best=0 size dir
+    v=$(cfg_text gpu.card)
+    if [[ -n $v ]]; then
+        [[ $v == /* ]] || v="/sys/class/drm/$v/device"
+        [[ -d $v ]] && { echo "$v"; return 0; }
+        return 1
+    fi
+    for dir in /sys/class/drm/card[0-9]*/device; do
+        [[ -r $dir/mem_info_vram_total ]] || continue
+        size=$(cat "$dir/mem_info_vram_total" 2>/dev/null) || continue
+        (( size > best )) && { best=$size; v=$dir; }
+    done
+    [[ -n $v ]] || return 1
+    echo "$v"
+}
 cfg_set() {
     mkdir -p "$CFG_DIR" 2>/dev/null; touch "$CFG" 2>/dev/null
     # Rewritten rather than sed-substituted. Values are arbitrary text and model

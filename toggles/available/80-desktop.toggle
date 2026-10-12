@@ -81,7 +81,7 @@ _stale_seat() {
 # back slightly later. kwin needs a few hundred MB and fails outright without
 # them, so wait for the memory itself rather than trusting the ordering.
 _wait_vram() {
-    local need=$((700 * 1024 * 1024)) i free card=/sys/class/drm/card1/device
+    local need=$((700 * 1024 * 1024)) i free card; card=$(vc_gpu_card)
     [[ -r $card/mem_info_vram_total ]] || return 0      # no card, nothing to wait for
     for i in $(seq 1 30); do
         free=$(( $(cat "$card/mem_info_vram_total") - $(cat "$card/mem_info_vram_used") ))

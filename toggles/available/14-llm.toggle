@@ -111,7 +111,7 @@ t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] 
 
 # Free VRAM in MiB, or nothing when there is no discrete card to ask.
 _vram_free_mb() {
-    local card=/sys/class/drm/card1/device
+    local card; card=$(vc_gpu_card) || return 1
     [[ -r $card/mem_info_vram_total && -r $card/mem_info_vram_used ]] || return 1
     echo $(( ( $(cat "$card/mem_info_vram_total") - $(cat "$card/mem_info_vram_used") ) / 1048576 ))
 }
@@ -309,7 +309,7 @@ t_on() {
 # actually gone. Reporting "off" while the card still looks full is how the next
 # thing to want the GPU fails for no visible reason.
 t_off() {
-    local i card=/sys/class/drm/card1/device
+    local i card; card=$(vc_gpu_card)
     vc_progress "stopping the server"
     systemctl --user stop "$_unit" >/dev/null 2>&1
     [[ -r $card/mem_info_vram_used ]] || return 0
