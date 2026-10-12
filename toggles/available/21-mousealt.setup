@@ -15,6 +15,23 @@ cfg_default() {
     grep -qE "^$1=" "$CFG" 2>/dev/null && return 0
     mkdir -p "$(dirname "$CFG")"; printf '%s=%s\n' "$1" "$2" >>"$CFG"; echo "config: $1=$2"
 }
+# Earlier versions of this feature stored a single device name and a single USB
+# id, which covered the mouse only while it was on the receiver. Upgrade those
+# exact old defaults in place; anything the user has customised is left alone.
+cfg_upgrade() {
+    local key=$1 from=$2 to=$3
+    [[ $(cfgv "$key") == "$from" ]] || return 0
+    sed -i "s|^$key=.*|$key=$to|" "$CFG" && echo "config: $key upgraded to $to"
+}
+# Splits a comma-separated config value into one item per line.
+cfg_list() {
+    local v; v=$(cfgv "$1"); v="${v:-$2}"
+    local IFS=','; local x
+    for x in $v; do
+        x="${x#"${x%%[![:space:]]*}"}"; x="${x%"${x##*[![:space:]]}"}"
+        [[ -n $x ]] && printf '%s\n' "$x"
+    done
+}
 
 case "${1:-}" in
 phases) printf 'check\ninstall\nuninstall\nroot-install\nroot-uninstall\n' ;;
@@ -27,12 +44,29 @@ check)
     # read is invisible, and start fails with "unknown ... or you are missing
     # permissions". Input nodes are root:input; only devices tagged uaccess get
     # an ACL for the logged-in user.
-    dev=$(cfgv mousealt.device); dev="${dev:-Logitech G502}"
-    input-remapper-control --list-devices 2>/dev/null | grep -qxF "$dev" \
-        || { echo "$dev is not visible to input-remapper (needs the uaccess rule)"; exit 1; }
+    #
+    # ANY of the listed identities being visible is enough, not all of them: the
+    # wired identity only exists while the charging cable is in. Failing on the
+    # absent one would make the check depend on where the cable happens to be.
+    visible=$(input-remapper-control --list-devices 2>/dev/null)
+    seen=0; missing=()
+    while IFS= read -r dev; do
+        if grep -qxF "$dev" <<<"$visible"; then seen=$((seen + 1)); else missing+=("$dev"); fi
+    done < <(cfg_list mousealt.device "Logitech G502")
+    (( seen )) || {
+        echo "none of the configured devices are visible to input-remapper"
+        echo "  (needs the uaccess rule; run: sudo ./install.sh --root)"
+        exit 1
+    }
+    # Invisible means either "not plugged in" or "no uaccess rule yet", and the
+    # two are indistinguishable from here, so the note says both.
+    (( ${#missing[@]} )) && printf 'note: not visible to input-remapper (not connected, or no uaccess rule yet): %s\n' \
+        "${missing[*]}"
     ;;
 install)
-    cfg_default mousealt.device "Logitech G502"
+    cfg_default mousealt.device "Logitech G502,Logitech G502 LIGHTSPEED Wireless Gaming Mouse"
+    cfg_upgrade mousealt.device "Logitech G502" \
+        "Logitech G502,Logitech G502 LIGHTSPEED Wireless Gaming Mouse"
     cfg_default mousealt.preset vibecontrol-mousealt
     # BTN_SIDE is the back button on a stock G502. If the mouse's onboard memory
     # has been programmed the button may send something else entirely, which is
@@ -40,12 +74,16 @@ install)
     cfg_default mousealt.button BTN_SIDE
     cfg_default mousealt.output KEY_LEFTALT
     # USB id the uaccess rule targets, so the root phase is not hardcoded either.
-    cfg_default mousealt.usb_id 046d:c539
-    dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
+    # Both USB ids: the receiver, and the mouse's own interface when cabled.
+    cfg_default mousealt.usb_id 046d:c539,046d:c08d
+    cfg_upgrade mousealt.usb_id 046d:c539 046d:c08d,046d:c539
+    preset=$(cfgv mousealt.preset)
     btn=$(cfgv mousealt.button); out=$(cfgv mousealt.output)
-    python3 - "$IR" "$dev" "$preset" "$btn" "$out" <<'PY'
+    mapfile -t devs < <(cfg_list mousealt.device "Logitech G502")
+    python3 - "$IR" "$preset" "$btn" "$out" "${devs[@]}" <<'PY'
 import glob, json, os, sys
-ir, dev, preset, btn, out = sys.argv[1:6]
+ir, preset, btn, out = sys.argv[1:5]
+devices = sys.argv[5:]
 try:
     from evdev import ecodes
 except ImportError:
@@ -53,38 +91,46 @@ except ImportError:
 code = ecodes.ecodes.get(btn)
 if code is None:
     sys.exit("unknown button name: %s" % btn)
-d = os.path.join(ir, "presets", dev)
-os.makedirs(d, exist_ok=True)
-# Reuse the origin_hash from a sibling preset: it identifies the sub-device the
-# events arrive on, and getting it wrong means the mapping never fires.
-origin = None
-for f in glob.glob(os.path.join(d, "*.json")):
-    if os.path.basename(f) == preset + ".json":
-        continue
-    try:
-        for m in json.load(open(f)):
-            for c in m.get("input_combination", []):
-                if c.get("origin_hash"):
-                    origin = c["origin_hash"]; raise StopIteration
-    except StopIteration:
-        break
-    except Exception:
-        continue
-combo = {"type": 1, "code": code}
-if origin:
-    combo["origin_hash"] = origin
-path = os.path.join(d, preset + ".json")
-json.dump([{
-    "input_combination": [combo],
-    "target_uinput": "keyboard",
-    # A bare key name holds that key for as long as the button is held, which is
-    # what a modifier has to do; a macro would fire once and release.
-    "output_symbol": out,
-    "name": "vibecontrol: %s as %s" % (btn, out),
-    "mapping_type": "key_macro",
-}], open(path, "w"), indent=4)
-print("wrote %s (%s code %d -> %s, origin_hash %s)"
-      % (path, btn, code, out, origin or "none found"))
+
+
+def origin_hash(d):
+    # Reuse the origin_hash from a sibling preset IN THE SAME DIRECTORY: it
+    # identifies the sub-device the events arrive on, so it is specific to one
+    # device identity. Copying it between the wired and wireless directories
+    # would point at the wrong node and the mapping would never fire.
+    for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+        if os.path.basename(f) == preset + ".json":
+            continue
+        try:
+            for m in json.load(open(f)):
+                for c in m.get("input_combination", []):
+                    if c.get("origin_hash"):
+                        return c["origin_hash"]
+        except Exception:
+            continue
+    return None
+
+
+for dev in devices:
+    d = os.path.join(ir, "presets", dev)
+    os.makedirs(d, exist_ok=True)
+    origin = origin_hash(d)
+    combo = {"type": 1, "code": code}
+    if origin:
+        combo["origin_hash"] = origin
+    path = os.path.join(d, preset + ".json")
+    json.dump([{
+        "input_combination": [combo],
+        "target_uinput": "keyboard",
+        # A bare key name holds that key for as long as the button is held,
+        # which is what a modifier has to do; a macro would fire once and
+        # release.
+        "output_symbol": out,
+        "name": "vibecontrol: %s as %s" % (btn, out),
+        "mapping_type": "key_macro",
+    }], open(path, "w"), indent=4)
+    print("wrote %s (%s code %d -> %s, origin_hash %s)"
+          % (path, btn, code, out, origin or "none found"))
 PY
     : ;;
 root-install)
@@ -92,21 +138,24 @@ root-install)
     # read access to every input device, keyboards included, which is a
     # keylogging surface; uaccess is logind giving the *active session* user an
     # ACL on this one device, and it goes away with the session.
-    usb=$(cfgv mousealt.usb_id); usb="${usb:-046d:c539}"
-    vid="${usb%%:*}"; pid="${usb##*:}"
     f=/etc/udev/rules.d/70-vibecontrol-mousealt.rules
     {
-      echo '# Installed by vibecontrol (toggles/available/24-mousealt.setup).'
-      echo '# Lets the logged-in user'"'"'s input-remapper client see this device: it'
+      echo '# Installed by vibecontrol (toggles/available/21-mousealt.setup).'
+      echo '# Lets the logged-in user'"'"'s input-remapper client see these devices: it'
       echo '# classifies devices by opening them, so one it cannot read does not exist'
-      echo '# as far as it is concerned. Scoped to a single USB id, not the input group.'
-      printf 'SUBSYSTEM=="input", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", TAG+="uaccess"\n' "$vid" "$pid"
+      echo '# as far as it is concerned. Scoped to specific USB ids, not the input group.'
+      echo '# One line per id: the mouse enumerates differently on the receiver than it'
+      echo '# does on the charging cable, and the feature has to cover both.'
+      while IFS= read -r usb; do
+          printf 'SUBSYSTEM=="input", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", TAG+="uaccess"\n' \
+              "${usb%%:*}" "${usb##*:}"
+      done < <(cfg_list mousealt.usb_id 046d:c539)
     } >"$f"
     chmod 0644 "$f"
     udevadm control --reload-rules 2>/dev/null || true
     # Re-runs the add event so logind applies the ACL now, not at next replug.
     udevadm trigger --subsystem-match=input --action=add 2>/dev/null || true
-    echo "installed $f for $vid:$pid"
+    echo "installed $f for $(cfg_list mousealt.usb_id 046d:c539 | paste -sd' ')"
     : ;;
 root-uninstall)
     f=/etc/udev/rules.d/70-vibecontrol-mousealt.rules
@@ -114,9 +163,13 @@ root-uninstall)
     udevadm control --reload-rules 2>/dev/null || true
     : ;;
 uninstall)
-    dev=$(cfgv mousealt.device); preset=$(cfgv mousealt.preset)
-    f="$IR/presets/$dev/${preset:-vibecontrol-mousealt}.json"
-    [[ -f $f ]] && { rm -f "$f"; echo "removed $f"; } || echo "no preset to remove"
+    preset=$(cfgv mousealt.preset); preset="${preset:-vibecontrol-mousealt}"
+    gone=0
+    while IFS= read -r dev; do
+        f="$IR/presets/$dev/$preset.json"
+        [[ -f $f ]] && { rm -f "$f"; echo "removed $f"; gone=$((gone + 1)); }
+    done < <(cfg_list mousealt.device "Logitech G502")
+    (( gone )) || echo "no preset to remove"
     : ;;
 *) echo "usage: $0 {phases|check|install|uninstall}" >&2; exit 2 ;;
 esac

@@ -90,6 +90,9 @@ ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "
 # Keys offered to presets, in order. None of these collide with the fixed keys
 # (d/c/r/x/b), the cursor keys, or the positional digits.
 PRESET_KEYS = "poiuy"
+# Letters the client already owns. An alias may not take one of these, or a
+# config typo would shadow quit or the daemon key and look like a dead keyboard.
+RESERVED_KEYS = set("xdrcmbjk") | set(PRESET_KEYS)
 LEFT_COL = 44
 PRESET_CELL = 13
 
@@ -153,6 +156,26 @@ def badge(state, locked=False, timer="", forced=False):
     return colour + text + C["reset"]
 
 
+# Quant tokens as llama.cpp names them: Q4_K_M, IQ3_XXS, Q8_0, BF16, MXFP4.
+# Anchored on a separator so "Qwen3.8" and "A4B" cannot match.
+_QUANT_RE = re.compile(
+    r"(?:^|[-_.])(I?Q\d+(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4)(?=[-_.]|$)", re.I)
+
+
+def _quant_of(base):
+    """Quant label for a GGUF basename, with +mtp when it carries the MTP head.
+
+    The multi-token-prediction build matters at a glance: it is the only thing
+    that makes --spec-type draft-mtp available, and the two files are otherwise
+    named identically.
+    """
+    hits = _QUANT_RE.findall(base)
+    q = hits[-1].upper() if hits else "?"
+    if re.search(r"[-_.]mtp(?=[-_.]|$)", base, re.I):
+        q += "+mtp"
+    return q[:11]
+
+
 class Row:
     """One line of the menu. Only rows with an action are selectable."""
 
@@ -197,6 +220,7 @@ class UI:
         self.daemon_armed = False
         self.preset_armed = None
         self.preset_keys = {}
+        self.alias_keys = {}
         self.last_frame = None
         self.rows = []
 
@@ -227,6 +251,21 @@ class UI:
 
     def auto_presets(self):
         return (self.doc or {}).get("auto") or {}
+
+    def aliases(self):
+        """{letter: toggle-id} from the daemon, minus anything unusable.
+
+        Dropped silently rather than reported: an alias is a convenience, and a
+        stale entry for a toggle that no longer exists should not put an error
+        on screen every refresh.
+        """
+        out = {}
+        ids = {t["id"] for t in self.toggles()}
+        for k, tid in (self.doc or {}).get("aliases", {}).items():
+            k = k.lower()
+            if len(k) == 1 and k not in RESERVED_KEYS and tid in ids:
+                out[k] = tid
+        return out
 
     def status_of(self, tid):
         for t in self.toggles():
@@ -396,6 +435,10 @@ class UI:
     # ----------------------------------------------------------------- rows
     def build(self):
         rows = []
+        # id -> letter. An aliased toggle keeps its place in the list but shows
+        # the letter where its number would be, and the positional digits skip
+        # it, so the numbering stays stable as aliases come and go.
+        alias_of = {tid: k for k, tid in self.aliases().items()}
         if self.screen == "model":
             selected, loaded = self.llm_selected(), self.llm_loaded()
             for m in self.llm_models():
@@ -403,7 +446,12 @@ class UI:
                 base = os.path.basename(path).replace(".gguf", "")
                 # The quant is the informative part of these filenames and the
                 # only part worth the width; the rest repeats the model name.
-                quant = base.split("-")[-1][:9]
+                # Not split("-")[-1]: that takes whatever trailing segment the
+                # uploader happened to add, so UD-IQ4_XS read as "XS",
+                # Q4_K_XL as "XL" and GSQ-RCO-IQ3_S-mtp as "mtp". Match the
+                # quant token itself and take the last one, since the model
+                # name can contain digits after a Q but never a full token.
+                quant = _quant_of(base)
                 size = "%.1fG" % (m.get("size", 0) / float(1 << 30))
                 # Architecture, because it is what decides whether this build can
                 # load the file at all. A model whose arch the installed
@@ -417,7 +465,7 @@ class UI:
                 else:
                     mark = ""
                 rows.append(Row(
-                    "%-34s %s%-6s %-9s %-10s%s%s"
+                    "%-34s %s%-6s %-11s %-10s%s%s"
                     % (base[:34], C["dim"], size, quant, arch, C["reset"], mark),
                     action=(lambda p=path: self.pick_model(p))))
             if not rows:
@@ -468,6 +516,7 @@ class UI:
                     rows.append(Row(section + suffix, heading=True))
                     for f in tops:
                         rows.append(Row(f["label"], self.display_state(f),
+                                        key=alias_of.get(f["id"]),
                                         locked=self.locked(f), tid=f["id"],
                                         timer=self.timer_of(f),
                                         forced=bool(f.get("forced")),
@@ -477,6 +526,7 @@ class UI:
                                 continue
                             rows.append(Row("  " + child["label"],
                                             self.display_state(child),
+                                            key=alias_of.get(child["id"]),
                                             locked=self.locked(child),
                                             tid=child["id"],
                                             timer=self.timer_of(child),
@@ -682,6 +732,12 @@ class UI:
                 self.screen = "model"
                 self.cursor = 0
                 self.cursor_placed = True
+            return True
+        if self.screen == "main" and ch in self.aliases():
+            tid = self.aliases()[ch]
+            tog = next((t for t in self.toggles() if t["id"] == tid), None)
+            if tog:
+                self.flip(tog)
             return True
         if ch.isdigit() and ch != "0":
             for r in self.rows:

@@ -312,6 +312,14 @@ write_state() {
         # only matches entries whose value is on or off.
         while IFS= read -r line; do echo "ph.${line#preset.}"; done \
             < <(grep -E '^preset\.[A-Za-z0-9_-]+\.hidden=1$' "$CFG" 2>/dev/null)
+        # Single-key aliases for toggles: alias.<letter>=<toggle-id> in the same
+        # flat config. Published rather than left for the client to read,
+        # because a client is not allowed to go behind the state document -- and
+        # declaring key= in a toggle file is what this replaces: keys in the
+        # files clashed and renumbered, while an alias is the user's own choice
+        # and lives with the rest of their settings.
+        while IFS= read -r line; do echo "al.${line#alias.}"; done \
+            < <(grep -E '^alias\.[A-Za-z]=[A-Za-z0-9_-]+$' "$CFG" 2>/dev/null)
         echo "on_boot=$(cfg_text on_boot)"
         echo "on_resume=$(cfg_text on_resume)"
     } | python3 "$CONV" >"$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE"

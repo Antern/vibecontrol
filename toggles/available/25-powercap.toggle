@@ -1,0 +1,79 @@
+category="common"
+label="GPU quiet mode"
+group="powercap"
+section="local ai"
+timeout=20
+# Switches the GPU between two LACT profiles that differ only in power_cap.
+#
+# Why this exists: under LLM load the card sits pinned at its cap and the VRM
+# sings -- a load-dependent noise that is not the fan (a 603-3736 rpm fan sweep
+# on an idle card was silent at every step). Capping the card stops it being
+# pinned. Measured cost at 221 W vs 307 W: about 41 tok/s against 44, so ~7%.
+#
+# Why through LACT rather than writing power1_cap directly: lactd owns this
+# card's settings -- it is what holds power_cap at 307 rather than the 317 W
+# default, and it re-applies its fan curve every 500 ms. Writing sysfs behind
+# its back means fighting it, which is exactly what made an earlier fan
+# experiment produce nonsense. Going through the daemon also persists the
+# choice across reboots and keeps the undervolt and fan curve intact, since
+# both profiles are based on the same default config.
+#
+# Why the socket rather than `lact cli`: the CLI here is the Flatpak build, so
+# every call pays about a second of flatpak startup, and the CLI cannot set a
+# power cap anyway -- it only switches profiles. The socket is what it talks to.
+# /run/lactd.sock is Antern:wheel and this user is in wheel, so no pkexec and no
+# polkit rule: category=common holds, and this works with no desktop.
+#
+# Config:
+#   powercap.profile_on  = quiet   (the capped profile; "on" means quiet)
+#   powercap.profile_off = full
+#
+# Both profiles must already exist in LACT. They were created with
+# create_profile base=default, then power_cap set to 221 and 307 respectively.
+_sock="/run/lactd.sock"
+
+_on_profile()  { local v; v=$(cfg_text powercap.profile_on);  echo "${v:-quiet}"; }
+_off_profile() { local v; v=$(cfg_text powercap.profile_off); echo "${v:-full}"; }
+
+_lact() { printf '%s\n' "$1" | timeout 5 nc -U "$_sock" 2>/dev/null; }
+
+# list_profiles carries current_profile; get_profile returns the config body
+# rather than the name, which is not what is needed here.
+_current() {
+    _lact '{"command":"list_profiles","args":{}}' \
+      | sed -n 's/.*"current_profile":"\([^"]*\)".*/\1/p'
+}
+
+_switch() {
+    local want="$1"
+    _lact "{\"command\":\"set_profile\",\"args\":{\"name\":\"$want\"}}" >/dev/null
+    # Confirm rather than assume: a name that does not exist returns ok-ish and
+    # leaves the profile unchanged, which would otherwise look like success.
+    local i
+    for i in 1 2 3 4 5; do
+        [[ $(_current) == "$want" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+t_status() {
+    [[ -S $_sock ]] || { echo off; return; }
+    [[ $(_current) == "$(_on_profile)" ]] && echo on || echo off
+}
+
+# rc 2 is "not configured": without the daemon or the profiles there is nothing
+# to retry until someone creates them.
+t_on() {
+    [[ -S $_sock ]] || return 2
+    _lact '{"command":"list_profiles","args":{}}' | grep -q "\"$(_on_profile)\"" || return 2
+    vc_progress "switching to $(_on_profile)"
+    _switch "$(_on_profile)"
+}
+
+t_off() {
+    [[ -S $_sock ]] || return 2
+    _lact '{"command":"list_profiles","args":{}}' | grep -q "\"$(_off_profile)\"" || return 2
+    vc_progress "switching to $(_off_profile)"
+    _switch "$(_off_profile)"
+}

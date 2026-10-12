@@ -8,7 +8,8 @@ Input lines (order of f.<n>.* decides feature order):
 import json
 import sys
 
-raw = {"daemon": {}, "toggles": {}, "groups": {}, "config": {}, "presets": {}, "msg": "",
+raw = {"daemon": {}, "toggles": {}, "groups": {}, "config": {}, "presets": {},
+       "aliases": {}, "msg": "",
        "graphical": "0", "llm_profile": "", "profiles": {},
        "llm_model": "", "llm_loaded": "", "models": {},
        "hidden": set(), "on_boot": "", "on_resume": ""}
@@ -50,6 +51,8 @@ for line in sys.stdin:
         raw[key] = value
     elif key.startswith("ph."):
         raw["hidden"].add(key[3:].split(".", 1)[0])
+    elif key.startswith("al."):
+        raw["aliases"][key[3:]] = value
     elif key.startswith("p."):
         _, name, toggle = key.split(".", 2)
         raw["presets"].setdefault(name, {})[toggle] = value
@@ -87,6 +90,8 @@ doc = {
     },
     "config": raw["config"],
     "presets": raw["presets"],
+    # {"a": "mousealt", ...} -- a key a client may bind straight to a toggle.
+    "aliases": raw["aliases"],
     "llm": {
         "profile": raw["llm_profile"] or None,
         "profiles": raw["profiles"],

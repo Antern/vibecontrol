@@ -15,10 +15,20 @@ timeout=20
 # it is already installed and running as a system service.
 #
 # Config, so none of it is baked in:
-#   mousealt.device = Logitech G502          (key from --list-devices)
+#   mousealt.device = Logitech G502,Logitech G502 LIGHTSPEED ...   (comma list)
 #   mousealt.preset = vibecontrol-mousealt
 #   mousealt.button = BTN_SIDE               (what the button actually sends)
 #   mousealt.output = KEY_LEFTALT
+#
+# mousealt.device is a LIST because the mouse has two identities and which one
+# is live depends on whether the charging cable is in:
+#   046d:c539 "Logitech G502"                        - via Lightspeed receiver
+#   046d:c08d "Logitech G502 LIGHTSPEED Wireless ..." - cable plugged in
+# Only one of them emits events at a time, so the preset is started on BOTH and
+# whichever is idle simply injects nothing. This is deliberately not a case of
+# detecting the active one: the receiver's node LINGERS in --list-devices and in
+# /proc/bus/input/devices while the mouse is running wired, so presence says
+# nothing about which path the events are actually taking.
 #
 # If the button does nothing once this is on, the button name is the thing to
 # check first: a G502 with programmed onboard memory can send anything, and this
@@ -27,7 +37,17 @@ timeout=20
 #   sudo python3 -c "import evdev;d=evdev.InputDevice('/dev/input/event8')
 #   [print(evdev.categorize(e)) for e in d.read_loop() if e.type==1 and e.value==1]"
 
-_dev()    { local v; v=$(cfg_text mousealt.device); echo "${v:-Logitech G502}"; }
+# One device per line. Commas separate, surrounding blanks are ignored, so the
+# config stays readable when both identities are listed.
+_devs() {
+    local v; v=$(cfg_text mousealt.device)
+    v="${v:-Logitech G502,Logitech G502 LIGHTSPEED Wireless Gaming Mouse}"
+    local IFS=','; local d
+    for d in $v; do
+        d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+        [[ -n $d ]] && printf '%s\n' "$d"
+    done
+}
 _preset() { local v; v=$(cfg_text mousealt.preset); echo "${v:-vibecontrol-mousealt}"; }
 _marker() { echo "${XDG_RUNTIME_DIR:-/tmp}/vibecontrol/mousealt.on"; }
 
@@ -44,13 +64,29 @@ t_status() {
 
 t_on() {
     command -v input-remapper-control >/dev/null 2>&1 || return 2
-    local ir="$HOME/.config/input-remapper-2/presets/$(_dev)/$(_preset).json"
+
+    local preset dev base configured=0 started=0
+    preset=$(_preset); base="$HOME/.config/input-remapper-2/presets"
+
     # rc 2 is "not configured" rather than "failed": there is nothing to retry
-    # until the preset exists, and the daemon reports it as unavailable.
-    [[ -f $ir ]] || return 2
-    vc_progress "loading $(_preset)"
-    input-remapper-control --command start --device "$(_dev)" --preset "$(_preset)" \
-        >/dev/null 2>&1 || return 1
+    # until at least one preset exists, and the daemon reports it unavailable.
+    while IFS= read -r dev; do
+        [[ -f "$base/$dev/$preset.json" ]] && configured=1
+    done < <(_devs)
+    (( configured )) || return 2
+
+    vc_progress "loading $preset"
+    # Started on every configured identity, not just the one that looks present.
+    # A start against the identity that is currently idle is a no-op, and one
+    # failure is not fatal as long as another took: the mouse can only be on one
+    # connection at a time, so the successful one is by definition the live one.
+    while IFS= read -r dev; do
+        [[ -f "$base/$dev/$preset.json" ]] || continue
+        input-remapper-control --command start --device "$dev" --preset "$preset" \
+            >/dev/null 2>&1 && started=$((started + 1))
+    done < <(_devs)
+    (( started )) || return 1
+
     mkdir -p "$(dirname "$(_marker)")"; : > "$(_marker)"
     # The CLI returns before the injector is up, so confirm rather than assume.
     local i
@@ -62,11 +98,15 @@ t_on() {
 t_off() {
     rm -f "$(_marker)"
     command -v input-remapper-control >/dev/null 2>&1 || return 0
-    # autoload rather than stop: this machine's config autoloads a macro preset
-    # for the same mouse, and stopping outright would silently take that away
-    # too. autoload puts back whatever the config says should be there, so this
-    # feature is a temporary override rather than something that clears the slate.
-    input-remapper-control --command stop --device "$(_dev)" >/dev/null 2>&1
+    local dev
+    while IFS= read -r dev; do
+        input-remapper-control --command stop --device "$dev" >/dev/null 2>&1
+    done < <(_devs)
+    # autoload rather than leaving it stopped: this machine's config autoloads a
+    # macro preset for the same mouse, and stopping outright would silently take
+    # that away too. autoload puts back whatever the config says should be there,
+    # so this feature is a temporary override rather than clearing the slate.
+    # One call covers every device.
     input-remapper-control --command autoload >/dev/null 2>&1
     return 0
 }

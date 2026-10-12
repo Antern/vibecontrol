@@ -25,6 +25,10 @@ _unit="vibecontrol-llm"
 #   llm.alias   = local            (name clients use; default "local")
 #   llm.mcp_config = /path/to/mcp.json         (optional)
 #   llm.cors_origins = http://<hotspot-ip>:8080   (optional)
+#   llm.cache_type_k = q8_0 | q5_1 | q4_0      (default q8_0)
+#   llm.cache_type_v = q8_0 | q5_1 | q4_0      (default q8_0)
+#   llm.spec_type    = draft-mtp               (optional, needs an -mtp GGUF)
+#   llm.spec_draft_n_max = 2                   (optional)
 #
 # llm.mcp_config gives the server tools. llama-server spawns each declared MCP
 # server itself, as a child process speaking JSON-RPC on stdio -- the only
@@ -74,6 +78,10 @@ _alias()   { local v; v=$(_p alias); echo "${v:-local}"; }
 _mcpcfg()  { _p mcp_config; }
 _cors()    { _p cors_origins; }
 _parallel() { local v; v=$(_p parallel); echo "${v:-1}"; }
+# q8_0 is the default because it was the hardcoded value before these became
+# configurable, and no existing profile should change behaviour silently.
+_ctk() { local v; v=$(_p cache_type_k); echo "${v:-q8_0}"; }
+_ctv() { local v; v=$(_p cache_type_v); echo "${v:-q8_0}"; }
 
 t_status() { [[ $(systemctl --user is-active "$_unit" 2>/dev/null) == active ]] && echo on || echo off; }
 
@@ -130,7 +138,13 @@ t_on() {
         # attention, and the server refuses to start without it. It takes a
         # value since 0.4.1 -- a bare -fa swallows the next argument and the
         # server dies with "unknown value for --flash-attn: '-ctk'".
-        -fa on -ctk q8_0 -ctv q8_0
+        # cache_type_k/cache_type_v are config because the KV cache, not the
+        # weights, is what decides how much context fits. This model carries
+        # 4 KV heads x 256+256 across 64 attention layers = 128 Ki elements per
+        # token, so one token costs 136 KiB at q8_0, 96 KiB at q5_1 and 72 KiB
+        # at q4_0. A 200k context is therefore 26 GB, 18 GB or 14 GB of cache --
+        # the difference between fitting beside the weights and not.
+        -fa on -ctk "$(_ctk)" -ctv "$(_ctv)"
         -ngl 999 -c "$ctx"
         # Without an alias the model id is the full path on disk, which is what
         # a client has to type as the model name.
@@ -158,6 +172,32 @@ t_on() {
     # conversation every turn, so keeping old prefixes around turns a full
     # reprocess into a cache hit.
     v=$(_p cache_ram);        [[ -n $v ]] && args+=(--cache-ram "$v")
+
+    # Speculative decoding. draft-mtp uses the multi-token-prediction head that
+    # an "-mtp" GGUF carries, drafting against the target model itself -- the
+    # server logs "creating MTP draft context against the target model", so no
+    # separate draft file is involved and spec_draft_model stays unset for it.
+    #
+    # Measured on this card, Qwen3.8-27B GSQ-RCO IQ3_S, 600-token generations:
+    #   off        26.9 tok/s at ctx 122880
+    #   n-max 2    44.1 tok/s at ctx  81920   <- chosen
+    #   n-max 3    39.7 tok/s at ctx  65536
+    #   n-max 4    35.4 tok/s at ctx  65536
+    #   n-max 6    does not fit
+    # Deeper drafts are monotonically slower: more tokens are drafted than get
+    # accepted, so the extra forward passes are wasted. 2 is the optimum here.
+    #
+    # It is not free: the draft context and its compute buffers take VRAM out of
+    # the KV cache, which is what drops the usable context from 122880 to 81920.
+    #
+    # 81920 and not 86016: 86016 starts and listens, then ABORTS on the first
+    # real request with VRAM at 15.89 of 15.92 GB. Bisecting on "does it start"
+    # overshoots -- the compute buffers for an actual decode are allocated
+    # later than the KV cache, so a context can pass startup and still be
+    # unusable. Any future ceiling hunt has to generate, not just boot.
+    v=$(_p spec_type);        [[ -n $v ]] && args+=(--spec-type "$v")
+    v=$(_p spec_draft_n_max); [[ -n $v ]] && args+=(--spec-draft-n-max "$v")
+    v=$(_p spec_draft_model); [[ -n $v ]] && args+=(--spec-draft-model "$v")
     # A hard ceiling on thinking tokens, independent of how hard the model wants
     # to think. Without it a reasoning model can spend an entire reply budget
     # deliberating and return nothing.
@@ -190,8 +230,17 @@ t_on() {
 
     vc_progress "loading $(basename "$m")"
     systemctl --user reset-failed "$_unit" >/dev/null 2>&1
+    # GGML_CUDA_DISABLE_GRAPHS turns off ggml's HIP graph capture. On 2026-10-06
+    # llama-server took a SIGSEGV inside the ROCm runtime after half an hour of
+    # serving an agent harness: ggml_cuda_graph_evaluate_and_capture ->
+    # hipGraphExecUpdate -> amd::roc::VirtualGPU::submitKernelInternal, i.e. the
+    # driver crashed re-capturing the graph, not llama.cpp. Agent traffic is what
+    # provokes it -- long repeated decodes with changing batch shapes across
+    # slots mean the graph is rebuilt constantly. Costs a few percent throughput
+    # and removes the whole failure mode; drop it if ROCm fixes the path.
     systemd-run --user --unit="$_unit" --description="vibecontrol: local LLM server" \
         --setenv=HIP_VISIBLE_DEVICES=0 \
+        --setenv=GGML_CUDA_DISABLE_GRAPHS=1 \
         /usr/bin/llama-server "${args[@]}" >/dev/null 2>&1 || return 1
 
     # systemd returns the moment it forks, which is long before the weights are
