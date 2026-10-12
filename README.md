@@ -257,6 +257,10 @@ retry schedule did not help either -- every pass read the same stale value.
 
 ## Host prerequisites
 
+[`HARDWARE.md`](HARDWARE.md) describes the machine the defaults were written
+for and which toggles are hardware-specific. Everything below is software
+that has to be present.
+
 Some features need things installed on the machine itself. A feature with
 setup requirements documents them in a `.md` file beside it, so a new machine
 can be prepared before anything is toggled.
@@ -319,14 +323,30 @@ can be prepared before anything is toggled.
   the kernel instead, below evdev, so XKB, Wayland, XWayland, Wine and the text
   console all agree. Remapping in the keyboard's own firmware is better still
   where the hardware allows it.
-- **Mouse scrolling in Wine games** -- `install/mouse-scroll-quirk.sh`, run once
-  as root. A wheel that reports `REL_WHEEL_HI_RES` gives the Wayland desktop
-  smooth scrolling, but a Wine game receives input through XWayland, which folds
-  those 120-unit deltas back into X11 button 4/5 presses and can emit them with
-  the wrong sign at a detent boundary -- felt as scrolling that occasionally
-  jumps the other way, and as oversensitivity. The quirk disables the hi-res
-  axis for one USB id. It is system-wide by nature: desktop scrolling becomes
-  detent-based too, and a libinput quirk cannot be scoped to one application.
+- **Mouse settings that change when you plug the charger in** --
+  `install/mouse-input-config.sh`, run as yourself, no sudo. A wireless mouse
+  with a charging cable presents two different devices (`046d:407f` through its
+  receiver, `046d:c08d` on the cable). KDE keys per-device input settings to
+  vendor/product/name and has **no global fallback**, so the identity you never
+  configured falls back to libinput defaults -- adaptive acceleration, natural
+  scroll off -- which is why pointer speed and wheel direction change with the
+  cable. The script stamps both identities and pushes the settings onto the live
+  device, because `kcminputrc` is only read when a device is added and KWin's
+  `reconfigure()` does not cover per-device input config. Pass a name glob for
+  a different mouse: `./install/mouse-input-config.sh '*MX Master*'`.
+- **Mouse scrolling in Wine games** -- `install/mouse-scroll-quirk.sh`.
+  **This one did not work and is kept only for its `--undo`.** The theory: a
+  wheel reporting `REL_WHEEL_HI_RES` gives the Wayland desktop smooth
+  scrolling, but a Wine game receives input through XWayland, which folds those
+  120-unit deltas back into X11 button 4/5 presses and can emit them with the
+  wrong sign at a detent boundary -- felt as scrolling that occasionally jumps
+  the other way, and as oversensitivity. The script writes an
+  `AttrEventCodeDisable` quirk to drop the hi-res axis. It changed nothing on
+  the machine it was written for, and that attribute appears in none of
+  libinput's own shipped quirks, so treat it as a dead end rather than a fix --
+  if you ran it, `--undo` takes the block back out of `/etc`. Note also that a
+  libinput quirk is system-wide by nature and cannot be scoped to one
+  application, so desktop scrolling would become detent-based too.
 - **`40-steam.toggle`** — see [`toggles/40-steam.md`](toggles/40-steam.md).
   Remote Play needs rather more than the flag this feature toggles.
 
