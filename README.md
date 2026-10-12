@@ -13,8 +13,9 @@ daemon or the client.
                                 runs no feature work itself
     lib/state2json.py           flat key=value -> the JSON document
     lib/screensaver-inhibit.py  holds a freedesktop ScreenSaver inhibit
-    toggles/*.toggle          one file per toggle
-    toggles/*.md               per-toggle host prerequisites
+    toggles/available/*.toggle  one file per toggle
+    toggles/available/*.setup   its privileged install steps, if any
+    toggles/available/*.md      per-toggle host prerequisites
 
 ## API
 
@@ -168,11 +169,30 @@ whose group is busy is skipped rather than queued.
 Clients render presets as a matrix beside the menu: one column per preset,
 each cell on the same line as the toggle it refers to. Reading across a row
 shows what every preset would do to that toggle; reading down a column shows
-the whole preset. A cell is dim when the toggle already matches, highlighted
-when applying would change it, and a dash when the preset does not mention it.
+the whole preset. A cell is dim when the toggle already matches, blue
+when applying would change it, and a dash when the preset does not mention
+it.
 Applying asks for confirmation first, naming what would change.
 
 Column order follows the order the keys appear in the config file.
+
+### Colour
+
+One colour, one meaning:
+
+    green bold   on
+    dim          off, N/A, locked, or a preset cell already satisfied
+    yellow bold  a transition in flight, and an armed preset
+    red bold     a forced transition
+    cyan         a key you can press
+    blue bold    a preset cell that applying would change
+
+Only the 16 ANSI slots are used and no background is ever painted, so a
+terminal theme stays in charge; there is no truecolor here on purpose. Colour
+is suppressed when `NO_COLOR` is set and non-empty, when `TERM` is `dumb`, or
+with `--no-color`, and `FORCE_COLOR` overrides all three. Every state also
+carries a word -- `ON`, `OFF`, `~~ON~~`, `!!ON!!`, `N/A` -- so nothing depends
+on colour alone.
 
 Leave a toggle out unless the preset really needs to change it. `desktop`
 deliberately says nothing about Steam: the `-pipewire` flag costs nothing when
@@ -248,6 +268,13 @@ can be prepared before anything is toggled.
   contradicting `category="common"`. Scope the rule to that one unit and to
   the start/stop/restart verbs only, so whether sshd comes up at boot still
   requires admin authentication.
+- **`16-swap.toggle`** needs a polkit rule at
+  `/etc/polkit-1/rules.d/49-vibecontrol-swap.rules` allowing this user to
+  start and stop the zram swap unit (`dev-zram0.swap` by default, set
+  `swap.unit` to change it). `16-swap.setup` installs it; the same
+  reasoning as sshd applies, so it is a rule rather than `pkexec`. Scope it
+  to that one unit and to start/stop only, so whether swap comes up at boot
+  still requires admin authentication.
 - **`80-desktop.toggle`** needs `install/desktop-privileges.sh`, run once as
   root. It installs the equivalent polkit rule for the login manager and
   enables linger for the user. Linger is not optional: without it the user

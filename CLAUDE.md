@@ -15,7 +15,8 @@ than being inferred or hardcoded.
     bin/vibecontrold              daemon
     bin/vibecontrol               terminal client
     lib/state2json.py             flat key=value -> the JSON clients read
-    features/NN-<id>.toggle      one file per toggle
+    toggles/available/NN-<id>.toggle   one file per toggle
+    toggles/available/NN-<id>.setup    its privileged install steps
     systemd/…service  desktop/…desktop
 
 Runtime lives in `$XDG_RUNTIME_DIR/vibecontrol/`: `cmd` (fifo, clients ->
@@ -24,7 +25,10 @@ daemon), `state.json` (daemon -> clients, replaced atomically), `clients/<pid>.f
 
 ## Adding a feature
 
-Drop a file in `toggles/`. Nothing else needs editing.
+Drop a file in `toggles/available/` and symlink it into
+`~/.config/vibecontrol/toggles/` -- or let `install.sh --add=<id>` do both,
+which also records it in the manifest `install.sh --root` reads. Nothing
+else needs editing.
 
     category="common"        # common | wm
     label="Wake on LAN"

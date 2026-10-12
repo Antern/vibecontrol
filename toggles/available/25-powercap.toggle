@@ -21,8 +21,9 @@ timeout=20
 # Why the socket rather than `lact cli`: the CLI here is the Flatpak build, so
 # every call pays about a second of flatpak startup, and the CLI cannot set a
 # power cap anyway -- it only switches profiles. The socket is what it talks to.
-# /run/lactd.sock is Antern:wheel and this user is in wheel, so no pkexec and no
-# polkit rule: category=common holds, and this works with no desktop.
+# /run/lactd.sock is owned by LACT's admin_user:admin_group (wheel here) and
+# this user is in that group, so no pkexec and no polkit rule:
+# category=common holds, and this works with no desktop.
 #
 # Config:
 #   powercap.profile_on  = quiet   (the capped profile; "on" means quiet)
